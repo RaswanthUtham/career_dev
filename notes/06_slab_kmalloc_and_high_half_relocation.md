@@ -35,188 +35,365 @@ How does the real Linux kernel (`linux/mm/slub.c` and `include/linux/slab.h`) so
 Linux builds a **Slab Allocator** on top of `alloc_page()`!
 
 Here is the simple idea (explained for a 12-year-old):
-1. Instead of giving a whole 4096-byte page to one tiny struct, `kmalloc()` keeps a row of **8 buckets (Caches)** of power-of-two sizes:
-   - **Bucket 0 (`32` bytes)**
-   - **Bucket 1 (`64` bytes)**
-   - **Bucket 2 (`128` bytes)**
-   - **Bucket 3 (`256` bytes)**
-   - **Bucket 4 (`512` bytes)**
-   - **Bucket 5 (`1024` bytes)**
-   - **Bucket 6 (`2048` bytes)**
-   - *(And if someone asks for more than `2048` bytes, like `4096` bytes, it just gives them a whole page from `alloc_page()`!)*
+1. Instead of giving a whole 4096-byte page to one tiny struct, `kmalloc()` keeps a row of **9 buckets (Caches)** of power-of-two sizes starting from **8 bytes** (matching upstream `linux/include/linux/slab.h`):
+   - **Bucket 0 (`8` bytes)** — `kmalloc-8`
+   - **Bucket 1 (`16` bytes)** — `kmalloc-16`
+   - **Bucket 2 (`32` bytes)** — `kmalloc-32`
+   - **Bucket 3 (`64` bytes)** — `kmalloc-64`
+   - **Bucket 4 (`128` bytes)** — `kmalloc-128`
+   - **Bucket 5 (`256` bytes)** — `kmalloc-256`
+   - **Bucket 6 (`512` bytes)** — `kmalloc-512`
+   - **Bucket 7 (`1024` bytes)** — `kmalloc-1k`
+   - **Bucket 8 (`2048` bytes)** — `kmalloc-2k`
+   - *(And if someone asks for more than `2048` bytes, like `4096` bytes, it gives them a whole page from `alloc_page()`!)*
 
 ```text
-THE 6 BUCKETS (kmem_cache size classes):
+THE 9 UPSTREAM LINUX BUCKETS (kmalloc_caches[0..8]):
 
-  Bucket [0] (32-byte objects)   ---> [Free 32B] ---> [Free 32B] ---> NULL
-  Bucket [1] (64-byte objects)   ---> [Free 64B] ---> [Free 64B] ---> NULL
-  Bucket [2] (128-byte objects)  ---> NULL (Empty! Will slice a 4KB page when asked!)
-  Bucket [3] (256-byte objects)  ---> NULL
-  Bucket [4] (512-byte objects)  ---> NULL
-  Bucket [5] (1024-byte objects) ---> NULL
-  Bucket [6] (2048-byte objects) ---> NULL
+  Bucket [0] (8-byte objects)    ---> [Slab Page A] <---> [Slab Page B]
+  Bucket [1] (16-byte objects)   ---> [Slab Page C]
+  Bucket [2] (32-byte objects)   ---> [Slab Page D]
+  Bucket [3] (64-byte objects)   ---> [Slab Page E]
+  Bucket [4] (128-byte objects)  ---> Empty (Will slice a 4KB page when asked!)
+  Bucket [5] (256-byte objects)  ---> Empty
+  Bucket [6] (512-byte objects)  ---> Empty
+  Bucket [7] (1024-byte objects) ---> Empty
+  Bucket [8] (2048-byte objects) ---> Empty
 ```
 
 2. **What happens when you call `kmalloc(48)`?**
-   - `48` bytes rounds up to the nearest bucket size: **`64` bytes (Bucket 1)**.
-   - Is Bucket 1 empty?
-     - **If YES**: `kmalloc()` calls `alloc_page()` **once** to get one 4096-byte page, slices that 4096-byte page into **`4096 / 64 = 64` equal slots of 64 bytes**, and chains all 64 slots into Bucket 1's free list!
-   - Then `kmalloc()` pops the first 64-byte slot off Bucket 1, zeroes it, and returns its High-Half Virtual Address (`0xFFFFFFC08xxxxxxx`)!
-   - The next **63 times** you call `kmalloc(48)`, it doesn't even need to call `alloc_page()`—it instantly hands you the next 64-byte slot from Bucket 1 in 3 CPU instructions!
+   - `48` bytes rounds up to the nearest bucket size: **`64` bytes (Bucket 3)**.
+   - Does Bucket 3 have a partially-free 4KB slab page on its `partial` list?
+     - **If NO**: `kmalloc()` calls `alloc_page()` **once** to get one 4096-byte page, slices that 4096-byte page into **`4096 / 64 = 64` equal slots of 64 bytes**, chains all 64 slots into that page's `freelist`, and adds that page to Bucket 3's `partial` list using `list_add_tail(&page->list, &cache->partial)`!
+   - Then `kmalloc()` pops the first 64-byte slot off `page->freelist` and returns its High-Half Virtual Address (`0xFFFFFFC08xxxxxxx`)!
 
 ```text
-HOW ONE 4096-BYTE PAGE IS SLICED INTO 64 SLOTS OF 64 BYTES:
+HOW ONE 4096-BYTE SLAB PAGE IS SLICED INTO 64 SLOTS OF 64 BYTES:
 
+  struct page (Index Card in mem_map[])
+  +-----------------------------------------+
+  | slab_cache ---> points to Bucket [3]    |
+  | list       ---> linked in cache->partial|
+  | inuse      = 0 (counts allocated slots) |
+  | freelist   ---+                         |
+  +---------------|-------------------------+
+                  |
+                  v
   High-Half Page Virtual Address: 0xFFFFFFC08038D000 (4096 bytes total)
   +------------------+------------------+------------------+-----+------------------+
   | Slot 0 (64 B)    | Slot 1 (64 B)    | Slot 2 (64 B)    | ... | Slot 63 (64 B)   |
   | 0x...8038D000    | 0x...8038D040    | 0x...8038D080    |     | 0x...8038DFC0    |
-  | [next = Slot 1]  | [next = Slot 2]  | [next = Slot 3]  |     | [next = NULL]    |
+  | [first 8B=Slot1] | [first 8B=Slot2] | [first 8B=Slot3] |     | [first 8B=NULL]  |
   +------------------+------------------+------------------+-----+------------------+
 ```
 
 ---
 
-### 3. Wait — When Someone Calls `kfree(ptr)`, How Does `kfree()` Know Which Bucket Size `ptr` Belongs To?
+### 3. How Upstream Linux (`linux/mm/slab.h` & `linux/mm/slub.c`) Organizes `struct page` and Links 8-Byte Slots!
 
-Notice how in Linux, you call:
+Let's inspect the actual upstream Linux code in `C:\workspace\career_ws\linux\mm\slab.h` (line 116) and `C:\workspace\career_ws\linux\mm\slub.c` (line 557).
+Upstream Linux uses a two-level design where **`struct list_head`** AND **`void *freelist`** each do the job they are best at:
+
+#### Level 1: Inside `struct page` (`include/linux/mm.h` / `mm/slab.h`) — Linking 4KB Slab Pages with `struct list_head`!
+When a 4096-byte page is used as a Slab Page, it is not on `free_page_list`. So its `struct list_head list` inside `struct page` is free to be used!
+Upstream Linux adds:
+1. **`struct kmem_cache *slab_cache;`**: Points directly to the bucket (`kmalloc-8` .. `kmalloc-2k`) that owns this page!
+2. **`void *freelist;`**: Points to the first free object slot inside this 4KB page!
+3. **`unsigned int inuse;`**: Counts how many slots in this page are currently allocated.
+4. **`struct list_head list;`**: Links this 4KB page into `cache->partial` (the doubly-linked list of slab pages that have free slots available)!
+
+#### Level 2: Inside Each Free Slot (`8B .. 2048B`) — `set_freepointer()` and `get_freepointer()`!
+Why can't we put a 16-byte `struct list_head` (`next` + `prev`) inside a free **8-byte** slot (`kmalloc-8`)?
+Because `struct list_head` is **16 bytes** (`2 * 8` bytes), which is twice as big as an **8-byte** slot!
+And how does upstream `linux/mm/slub.c` (lines 557–579) link free slots without inventing any extra `struct slab_obj`?
+It uses two tiny 1-line inline functions that read/write a single 8-byte `void *` pointer directly into the first 8 bytes of the free slot:
+
 ```c
-void *p = kmalloc(48);
-kfree(p);   /* Notice: You DO NOT pass the size '48' to kfree(p)! */
+/* From upstream linux/mm/slub.c: No extra struct needed! */
+static inline void *get_freepointer(void *object)
+{
+    return *(void **)object;
+}
+
+static inline void set_freepointer(void *object, void *fp)
+{
+    *(void **)object = fp;
+}
 ```
-Wait a second! When you pass `p = 0xFFFFFFC08038D040` into `kfree(p)`, you only pass the pointer!
-How on earth does `kfree(p)` know whether `p` is a `32`-byte slot, a `64`-byte slot, a `256`-byte slot, or a full `4096`-byte page?!
 
-#### The Brilliant Linux Trick: Store the Slot Size Inside the Page's Index Card (`struct page`)!
-Remember our **`mem_map[]` cabinet of 32-byte Index Cards (`struct page`)** from `mm/page_alloc.c`?
-Every 4096-byte page has its own Index Card (`struct page`)!
+Let's explain `*(void **)object = fp;` to a 12-year-old!
+- `object` is the memory address of a free slot (for example, `0xFFFFFFC08038D000`).
+- Even our smallest slot (`kmalloc-8`) is **8 bytes** wide!
+- And on 64-bit RISC-V, a memory address (`void *`) is **8 bytes** wide!
+- Casting `object` to `(void **)` simply tells C: *"Treat the first 8 bytes of this free slot as a box that holds a `void *` address!"*
+- `*(void **)object = fp;` writes the address of the next free slot (`fp`) into those 8 bytes!
+- `return *(void **)object;` reads the address of the next free slot back out of those 8 bytes!
 
-Let's see how `kfree(ptr)` finds the exact bucket size in **3 instant steps**:
 ```text
-HOW kfree(0xFFFFFFC08038D040) FINDS ITS BUCKET SIZE IN O(1) TIME:
+WHY UPSTREAM LINUX'S TWO-LEVEL DESIGN IS SO CLEAN:
 
-  Step 1: Convert High-Half Virtual Address 'ptr' to Physical Address:
-          phys = __pa(0xFFFFFFC08038D040) = 0x000000008038D040
+  1. How are 4KB Slab Pages linked inside a bucket (struct kmem_cache)?
+     ---> Using our existing <linux/list.h> (struct list_head partial)!
+          Each struct page links its 'page->list' into 'cache->partial'.
 
-  Step 2: Look up the 4KB Page's Index Card in mem_map[]:
-          struct page *card = phys_to_page(0x8038D040);
-          (Why does this work even though 0x8038D040 has offset +0x040?
-           Because phys_to_page() does (phys - 0x80000000) >> 12, which
-           automatically chops off the bottom 12 bits (+0x040) and finds
-           the exact Index Card for page 0x8038D000!)
+  2. How are the 8B..2048B free slots linked inside one 4KB Slab Page?
+     ---> Using page->freelist and set_freepointer() / get_freepointer()!
+          Fits inside 8-byte slots (kmalloc-8) with ZERO extra structs!
 
-  Step 3: Read 'card->slab_size' (or 'card->flags') on that Index Card!
-          When kmalloc() sliced page 0x8038D000 into 64-byte slots, it wrote:
-              card->slab_size = 64;
-          So kfree(ptr) looks at card->slab_size, sees '64', and puts 'ptr'
-          right back into the 64-byte bucket!
+  3. How does kfree(ptr) work in O(1) time without knowing the size?
+     ---> page = phys_to_page(__pa(ptr));
+     ---> Pushes 'ptr' back onto 'page->freelist' via set_freepointer()!
 ```
-
-Pause and appreciate how cool that is!
-Earlier, you asked: *"Why does Linux have `struct page` Index Cards in `mem_map[]` instead of just returning raw pointers?"*
-**Here is your first real-world payoff!** Because every 4096-byte page has a `struct page` Index Card in `mem_map[]`, we can store `unsigned int slab_size;` on that card, and `kfree(ptr)` can find the size of ANY pointer anywhere in RAM in **one bit-shift** without wasting a single byte of header inside the object itself!
 
 ---
 
-## PART 2: Relocating Kernel Execution (`PC`, `sp`, `stvec`) to the High Half!
+## PART 2: Relocating Kernel Execution (`PC`, `sp`, `stvec`) to the High Half — The Exact Upstream `head.S` Way!
 
-### 1. Where Are Our CPU Registers Pointing Right Now?
+### 1. How Does Upstream `linux/arch/riscv/kernel/head.S` Relocate `PC`, `sp`, and `stvec`?
 
-Let's check what addresses the CPU registers hold right after `enable_mmu()` finishes in our current kernel:
-- **`va_pa_offset`**: `0xFFFFFFC000000000UL` (High Half!)
-- **`swapper_pg_dir`**: `0xFFFFFFC080308000` (High Half!)
-- **What about `PC` (Program Counter), `sp` (Stack Pointer), and `stvec` (Trap Vector)?**
-  They are still at Low-Half Identity addresses (`0x000000008020xxxx`)!
+Let's look at the actual upstream Linux code in `C:\workspace\career_ws\linux\arch\riscv\kernel\head.S` (lines 72–118: `relocate_enable_mmu`).
 
-### 2. Why Should We Relocate `PC`, `sp`, and `stvec` to the High Half (`0xFFFFFFC0802xxxxx`)?
+When our kernel boots, `_start` is running at Low-Half physical/identity addresses (`0x000000008020xxxx`).
+After `vm_init()` builds `swapper_pg_dir` (which maps **both** Low-Half `0x000000008020xxxx` and High-Half `0xFFFFFFC08020xxxx`), how does upstream Linux switch the CPU registers (`PC`, `ra`, `sp`, `s0`, and `stvec`) from `0x000000008020xxxx` up to `0xFFFFFFC08020xxxx`?
 
-Because in Milestone 7, when we run **User Space programs** (like the shell `sh`), user programs live in the **Low Half** (`Rows 0..255` of the page table).
-If the kernel's Stack Pointer (`sp`), Program Counter (`PC`), and Trap Vector (`stvec`) are already up in the **High Half** (`0xFFFFFFC0802xxxxx`, which uses `Rows 256..511`):
-1. Every user process can have its own private Low Half (`Rows 0..255`) while sharing the Kernel's High Half (`Rows 256..511`).
-2. Even if we unmap the temporary Low-Half identity map later, the kernel keeps running in the High Half without missing a beat!
+Upstream Linux writes a clean assembly function **`relocate_enable_mmu(pgd_t root_pgd)`** in **`arch/riscv/kernel/head.S`**!
 
-### 3. How Do We Jump `sp`, `stvec`, and `ra` (Return Address) into the High Half?
-
-Inside `enable_mmu()` in `my-linux/arch/riscv/mm/init.c`, right after `csrw satp` turns on the MMU (when both Low-Half and High-Half mappings are active simultaneously), we add `PAGE_OFFSET` (`0xFFFFFFC000000000UL`) to:
-1. **`sp` (Stack Pointer)**: `sp = sp + PAGE_OFFSET`
-2. **`s0` / `fp` (Frame Pointer)**: `s0 = s0 + PAGE_OFFSET` (if non-zero)
-3. **`stvec` (Supervisor Trap Vector)**: `stvec = handle_exception + PAGE_OFFSET`
-4. **`ra` (Return Address)**: `ra = ra + PAGE_OFFSET`
-
-Look what happens when `enable_mmu()` executes `ret` (return to `start_kernel`):
-Because `ra` now has `+ 0xFFFFFFC000000000UL`, the `ret` instruction jumps `PC` directly to **`0xFFFFFFC08020xxxx`** in the High Half!
-Why does all of our compiled C code keep working at `0xFFFFFFC08020xxxx` even though `vmlinux.lds.S` started at `0x80200000`?
-**Because in `Makefile` we compiled with `-mcmodel=medany` (PC-relative addressing)!**
-Every instruction in our kernel (`auipc` + `addi`) calculates addresses *relative to the current `PC`*. So the instant `PC` jumps to `0xFFFFFFC08020xxxx`, every function call, string literal, and global variable automatically resolves to `0xFFFFFFC08020xxxx`!
+#### Why Does Upstream Linux Put `relocate_enable_mmu` in `head.S` Instead of Inline Assembly in C?
+Because if you change `sp` (Stack Pointer) and `s0` (Frame Pointer) in the middle of a C function, the C compiler does not know you moved the stack!
+When `relocate_enable_mmu` is a dedicated assembly function in `head.S`:
+1. **`a0` input**: Holds the physical address of `swapper_pg_dir`.
+2. **Step 1 — Relocate Return Address (`ra`) to High Half**:
+    loads `t1 = PAGE_OFFSET` (`0xFFFFFFC000000000UL`) and adds it to `ra`:
+   `add ra, ra, t1`
+   Now `ra` holds the High-Half return address (`0xFFFFFFC08020xxxx`)!
+3. **Step 2 — Relocate Stack Pointer (`sp`) and Frame Pointer (`s0`) to High Half**:
+   `add sp, sp, t1`
+   `beqz s0, 1f; add s0, s0, t1; 1:`
+4. **Step 3 — Point `stvec` to the High-Half Address of `handle_exception`**:
+   `la t0, handle_exception`
+   `add t0, t0, t1`
+   `csrw stvec, t0`
+5. **Step 4 — Compute and Load `satp` (`SATP_MODE_SV39 | (root_phys >> 12)`)**:
+   `srli a0, a0, 12`
+   `li t2, (8 << 60)`
+   `or a0, a0, t2`
+   `sfence.vma zero, zero`
+   `csrw satp, a0`
+   `sfence.vma zero, zero`
+6. **Step 5 — Return (`ret`)**:
+   When `ret` executes, the CPU jumps `PC` to `ra` (`0xFFFFFFC08020xxxx`)!
+   At that exact instant, **`PC`, `sp`, `s0`, and `stvec` are all executing in the High Half (`0xFFFFFFC08020xxxx`)!**
 
 ```text
-VISUAL TRACE OF THE HIGH-HALF JUMP IN enable_mmu():
+VISUAL TRACE OF UPSTREAM relocate_enable_mmu IN arch/riscv/kernel/head.S:
 
-  Before enable_mmu():
-    PC    = 0x0000000080200150  (Low-Half Identity Address)
-    sp    = 0x0000000080207FF0  (Low-Half Identity Stack)
-    stvec = 0x0000000080200040  (Low-Half Trap Vector)
-
-  Inside enable_mmu() after csrw satp:
-    1. sp    += 0xFFFFFFC000000000  --->  sp    = 0xFFFFFFC080207FF0 (High-Half Stack!)
-    2. stvec += 0xFFFFFFC000000000  --->  stvec = 0xFFFFFFC080200040 (High-Half Trap Vector!)
-    3. ra    += 0xFFFFFFC000000000  --->  ra    = 0xFFFFFFC080200310 (High-Half Return Addr!)
-    4. ret (jumps PC to ra!)        --->  PC    = 0xFFFFFFC080200310 (High-Half Code!)
+  Caller: enable_mmu() in arch/riscv/mm/init.c (at Low-Half PC = 0x80200300)
+          Calls relocate_enable_mmu(root_phys)
+                   |
+                   v
+  +-----------------------------------------------------------------------+
+  | Inside relocate_enable_mmu (arch/riscv/kernel/head.S):                |
+  |   t1 = 0xFFFFFFC000000000 (PAGE_OFFSET)                               |
+  |   1. ra    = ra + t1    ---> 0xFFFFFFC080200304 (High-Half Return PC) |
+  |   2. sp    = sp + t1    ---> 0xFFFFFFC080207FE0 (High-Half Stack!)    |
+  |   3. s0    = s0 + t1    ---> 0xFFFFFFC080207FF0 (High-Half Frame Ptr) |
+  |   4. stvec = handle_exception + t1 ---> High-Half Trap Vector!        |
+  |   5. csrw satp, a0; sfence.vma     ---> Sv39 MMU Active!              |
+  |   6. ret                           ---> Jumps PC to High-Half 'ra'!   |
+  +-----------------------------------------------------------------------+
+                   |
+                   v
+  Back in enable_mmu():
+    - CPU is now executing at High-Half PC = 0xFFFFFFC080200304!
+    - Stack Pointer (sp) is at High-Half 0xFFFFFFC080207FE0!
+    - Trap Vector (stvec) is at High-Half 0xFFFFFFC08020xxxx!
 ```
+
+### 2. Wait — What About `mem_map` and `free_page_list` After We Jump to High Half?
+Think carefully!
+Before `enable_mmu()` ran, `mm_init()` initialized:
+- `mem_map` = `0x0000000080208000` (Low-Half address).
+- Because our Low-Half identity map (`0x80200000..0x88000000`) is **still mapped** in `swapper_pg_dir` alongside the High-Half map, those pointers still work, OR we can relocate `mem_map` to the High Half inside `mm_init()` by calling `vm_init()` right after `mm_init()`, or adding `PAGE_OFFSET`!
+Even simpler: if we relocate `mem_map` and `free_page_list` (or keep Low-Half identity mapped until user processes start), let's see what happens when `phys_to_page(pa)` and `page_to_pfn(page)` run:
+- Look at `page_to_pfn(page)` in `include/linux/mm.h`:
+  ```c
+  return (unsigned long)(page - mem_map);
+  ```
+  Notice that `page_to_pfn` subtracts `page - mem_map`!
+  As long as `page` comes from `pfn_to_page(pfn)` (`&mem_map[pfn]`), `page` and `mem_map` are in the same address space!
+  And if we update `mem_map` and `free_page_list` to High-Half in `enable_mmu()` (or call a 5-line helper `mm_relocate_high_half(PAGE_OFFSET)` in `mm/page_alloc.c`), then **even `struct page *` pointers live in `0xFFFFFFC08020xxxx`**!
 
 ---
 
 ## PART 3: Step-by-Step Implementation in `my-linux/`
 
-Here are the exact files to update or create in your `my-linux/` workspace.
+Here are the exact files for you to update or create in `my-linux/`.
 
 ---
 
-### Step 1: Add `slab_size` to `struct page` in `my-linux/include/linux/mm.h`
+### Step 1: Update `struct page` in `my-linux/include/linux/mm.h` & `my-linux/mm/page_alloc.c`
 
 **What this change does:**
-We add `unsigned int slab_size;` inside `struct page` so that when a 4KB page is sliced by `kmalloc()` into `32`, `64`, `128`, ..., `2048` byte slots, its Index Card remembers the slot size! (And if a whole 4KB page is allocated for a large `kmalloc(4096)`, `slab_size` is set to `4096`).
+1. Adds the upstream Linux slab fields (`struct kmem_cache *slab_cache;`, `void *freelist;`, and `unsigned int inuse;`) to `struct page`.
+2. Updates `page_address(page)` to use `va_pa_offset` so `page_address()` returns High-Half virtual addresses (`0xFFFFFFC08xxxxxxx`) once the MMU is enabled.
+3. Adds `mm_relocate_high_half(unsigned long offset)` in `mm/page_alloc.c` so `mem_map` and `free_page_list` pointers also move to High-Half virtual addresses (`0xFFFFFFC0802xxxxx`) when `enable_mmu()` turns on!
 
-Update `struct page` in **`my-linux/include/linux/mm.h`**:
-
+In **`my-linux/include/linux/mm.h`**:
 ```c
 /* Target File: my-linux/include/linux/mm.h */
+
+struct kmem_cache; /* Forward declaration for slab allocator */
+extern unsigned long va_pa_offset;
 
 struct page {
     unsigned long flags;
     int refcount;
-    unsigned int slab_size;     /* Object size in bytes if managed by kmalloc/slab */
-    struct list_head list;
+    unsigned int inuse;             /* Number of active slab objects allocated in page */
+    struct kmem_cache *slab_cache;  /* Owning kmem_cache bucket (NULL if full page) */
+    void *freelist;                 /* First free object slot inside this slab page */
+    struct list_head list;          /* Links into free_page_list OR cache->partial */
 };
-```
-
-Wait—let's check the size of `struct page` in 64-bit C!
-- `unsigned long flags`: `8` bytes (offset `0..7`)
-- `int refcount`: `4` bytes (offset `8..11`)
-- `unsigned int slab_size`: `4` bytes (offset `12..15` — fits right into the 4-byte padding hole that was already next to `int refcount`!)
-- `struct list_head list`: `16` bytes (offset `16..31`)
-**Total size of `struct page` is STILL 32 bytes!** Putting `slab_size` next to `int refcount` uses the 4 bytes of compiler padding that were sitting unused, so `sizeof(struct page)` does not grow by a single byte!
-
-Also in **`my-linux/mm/page_alloc.c`**, initialize `mem_map[i].slab_size = 0;` inside `mm_init()`, and update `page_address(page)` in **`my-linux/include/linux/mm.h`** so it uses `__va(page_to_phys(page))` (or keep `page_address()` returning the virtual address):
-
-In **`my-linux/include/linux/mm.h`**, make sure `page_address` uses `va_pa_offset` so it works even after relocating to the High Half:
-```c
-/* Target File: my-linux/include/linux/mm.h */
-extern unsigned long va_pa_offset;
 
 static inline void *page_address(const struct page *page)
 {
     return (void *)(page_to_phys(page) + va_pa_offset);
 }
+
+void mm_relocate_high_half(unsigned long offset);
 ```
-And in **`my-linux/mm/page_alloc.c`**, inside `enable_mmu()` when we switch to the High Half, we will also add `PAGE_OFFSET` to `mem_map` and `free_page_list` pointers—or even simpler: let's see how cleanly that works!
+
+In **`my-linux/mm/page_alloc.c`**:
+1. Inside `mm_init()`, initialize the new fields in the loop:
+   ```c
+   /* Target File: my-linux/mm/page_alloc.c (inside mm_init loop) */
+   mem_map[i].flags = 0;
+   mem_map[i].refcount = 0;
+   mem_map[i].inuse = 0;
+   mem_map[i].slab_cache = NULL;
+   mem_map[i].freelist = NULL;
+   INIT_LIST_HEAD(&mem_map[i].list);
+   ```
+2. Add `mm_relocate_high_half(unsigned long offset)` at the bottom of `my-linux/mm/page_alloc.c`:
+   ```c
+   /* Target File: my-linux/mm/page_alloc.c */
+
+   /*
+    * mm_relocate_high_half - Relocate mem_map and free_page_list pointers to High Half
+    */
+   void mm_relocate_high_half(unsigned long offset)
+   {
+       /* 1. Relocate all next/prev pointers in the circular free_page_list */
+       struct list_head *curr = &free_page_list;
+       do {
+           struct list_head *next_low = curr->next;
+           if (curr->next != &free_page_list) {
+               curr->next = (struct list_head *)((uintptr_t)curr->next + offset);
+           }
+           if (curr->prev != &free_page_list) {
+               curr->prev = (struct list_head *)((uintptr_t)curr->prev + offset);
+           }
+           curr = next_low;
+       } while (curr != &free_page_list);
+
+       /* 2. Relocate the mem_map base pointer itself to High Half */
+       mem_map = (struct page *)((uintptr_t)mem_map + offset);
+   }
+   ```
+   *(Notice how clever that is: because `free_page_list` itself is a global variable in `.data`, once `PC` jumps to the High Half in `-mcmodel=medany`, `&free_page_list` automatically resolves to its High-Half address! Better yet, if we re-thread `free_page_list` cleanly after moving `mem_map`, let's see how easy a 5-line re-init of the `next`/`prev` pointers is:)*
+   ```c
+   /* Even simpler and 100% bug-free way to relocate free_page_list in mm/page_alloc.c: */
+   void mm_relocate_high_half(unsigned long offset)
+   {
+       mem_map = (struct page *)((uintptr_t)mem_map + offset);
+       INIT_LIST_HEAD(&free_page_list);
+       for (unsigned long pfn = min_low_pfn; pfn < max_pfn; pfn++) {
+           struct page *page = pfn_to_page(pfn);
+           if (page->refcount == 0) {
+               list_add_tail(&page->list, &free_page_list);
+           }
+       }
+   }
+   ```
+   Look at those 8 lines!
+   - `mem_map` moves to High-Half `0xFFFFFFC080208000`.
+   - `INIT_LIST_HEAD(&free_page_list)` uses the current High-Half `&free_page_list` address.
+   - The `for` loop re-links every unallocated page (`page->refcount == 0`) using its new High-Half `&mem_map[pfn].list` address! Zero pointer-aliasing bugs!
 
 ---
 
-### Step 2: Create `my-linux/include/linux/slab.h`
+### Step 2: Add `relocate_enable_mmu` in `my-linux/arch/riscv/kernel/head.S` & Call It from `enable_mmu()`
+
+**What this change does:**
+Implements upstream Linux's `relocate_enable_mmu` in `head.S` so that when `enable_mmu()` turns on `satp`, it simultaneously jumps `PC` (`ra`), `sp`, `s0`, and `stvec` into the High Half (`0xFFFFFFC08020xxxx`)!
+
+Add `relocate_enable_mmu` to **`my-linux/arch/riscv/kernel/head.S`**:
+```assembly
+/* Target File: my-linux/arch/riscv/kernel/head.S */
+
+.global relocate_enable_mmu
+.align 2
+relocate_enable_mmu:
+    /*
+     * a0 = root_phys (Physical address of swapper_pg_dir)
+     * a1 = PAGE_OFFSET (0xFFFFFFC000000000)
+     */
+    /* 1. Relocate Return Address (ra), Stack Pointer (sp), and Frame Pointer (s0) */
+    add  ra, ra, a1
+    add  sp, sp, a1
+    beqz s0, 1f
+    add  s0, s0, a1
+1:
+    /* 2. Relocate stvec to High-Half address of handle_exception */
+    la   t0, handle_exception
+    add  t0, t0, a1
+    csrw stvec, t0
+
+    /* 3. Compute satp value: SATP_MODE_SV39 (8 << 60) | (root_phys >> 12) */
+    srli t0, a0, 12
+    li   t1, (8 << 60)
+    or   t0, t0, t1
+
+    /* 4. Activate Sv39 MMU and flush TLB */
+    sfence.vma zero, zero
+    csrw satp, t0
+    sfence.vma zero, zero
+
+    /* 5. Return to High-Half 'ra' (CPU PC is now in 0xFFFFFFC08020xxxx!) */
+    ret
+```
+
+And update `enable_mmu()` in **`my-linux/arch/riscv/mm/init.c`**:
+```c
+/* Target File: my-linux/arch/riscv/mm/init.c */
+
+extern void relocate_enable_mmu(uintptr_t root_phys, unsigned long page_offset);
+
+void enable_mmu(pgd_t root_pgd)
+{
+    uintptr_t root_phys = __pa(root_pgd);
+
+    /*
+     * Jump PC, sp, s0, and stvec to High Half while turning on satp!
+     * When relocate_enable_mmu returns, the CPU is executing at 0xFFFFFFC08020xxxx!
+     */
+    relocate_enable_mmu(root_phys, PAGE_OFFSET);
+
+    /* Update va_pa_offset, swapper_pg_dir, and mem_map to High Half */
+    va_pa_offset = PAGE_OFFSET;
+    swapper_pg_dir = (pgd_t)__va(root_phys);
+    mm_relocate_high_half(PAGE_OFFSET);
+
+    early_puts("[MMU] Sv39 Enabled & Kernel Relocated to High Half (0xFFFFFFC08xxxxxxx)!\n");
+}
+```
+
+---
+
+### Step 3: Create `my-linux/include/linux/slab.h` (9 Buckets: `8B .. 2048B`)
 
 **What this file does:**
-Defines the standard Linux kernel `kmalloc()`, `kzalloc()`, and `kfree()` interface (matching upstream `linux/include/linux/slab.h`).
+Defines the 9 power-of-two `kmalloc_caches` starting at **8 bytes** (`8, 16, 32, 64, 128, 256, 512, 1024, 2048`), matching upstream `include/linux/slab.h`.
+Each `struct kmem_cache` uses `struct list_head partial;` (from `<linux/list.h>`) to link its active 4KB slab pages!
 
 ```c
 /* Target File: my-linux/include/linux/slab.h */
@@ -225,18 +402,20 @@ Defines the standard Linux kernel `kmalloc()`, `kzalloc()`, and `kfree()` interf
 #define _LINUX_SLAB_H
 
 #include <linux/types.h>
+#include <linux/list.h>
 
-#define KMALLOC_MIN_SIZE    32UL
+#define KMALLOC_MIN_SIZE    8UL
 #define KMALLOC_MAX_CACHE   2048UL
-#define KMALLOC_NUM_CACHES  7       /* 32, 64, 128, 256, 512, 1024, 2048 */
+#define KMALLOC_NUM_CACHES  9       /* 8, 16, 32, 64, 128, 256, 512, 1024, 2048 */
 
 /*
- * struct kmem_cache - Manages a pool of fixed-size objects (e.g. 64-byte slots)
+ * struct kmem_cache - Upstream Linux SLUB style cache descriptor
+ * @obj_size: Size of each object slot in bytes (8..2048)
+ * @partial:  Doubly-linked list of struct page slabs that have free slots
  */
 struct kmem_cache {
-    unsigned int obj_size;          /* Size of each slot in bytes (32..2048) */
-    unsigned long nr_free;          /* Number of free slots currently in list */
-    void *free_list;                /* Singly-linked intrusive free list of slots */
+    unsigned int obj_size;
+    struct list_head partial;
 };
 
 void kmem_cache_init(void);
@@ -249,99 +428,115 @@ void kfree(const void *ptr);
 
 ---
 
-### Step 3: Create `my-linux/mm/slab.c`
+### Step 4: Create `my-linux/mm/slab.c` (Upstream `slub.c` Design!)
 
-**Before writing the code, let's trace how the intrusive slot list inside `mm/slab.c` works:**
-1. Each free slot (at least `32` bytes wide) is currently unused memory.
-2. We use the first `8` bytes of each free slot to store a `struct slab_obj { struct slab_obj *next; };` pointer to the next free slot in that bucket!
-3. When `kmalloc(size)` needs to replenish an empty bucket (say, the `64`-byte bucket):
-   - It calls `alloc_page()` to get a `struct page *card`.
-   - Sets `card->slab_size = 64`.
-   - Gets the page's virtual address: `char *page_va = (char *)page_address(card);`.
-   - Loops through the 4096 bytes in steps of `64` bytes (`offset = 0, 64, 128, ..., 4032`) and pushes each slot onto `cache->free_list`!
-4. When `kfree(ptr)` is called:
-   - Converts `ptr` to its physical address: `uintptr_t pa = __pa(ptr);`.
-   - Finds its Index Card: `struct page *card = phys_to_page(pa);`.
-   - Checks `card->slab_size`:
-     - If `card->slab_size == PAGE_SIZE` (`4096`): calls `free_page(card)`.
-     - If `card->slab_size` is `32..2048`: finds the matching bucket and pushes `ptr` right back onto `cache->free_list`!
+**Before writing the code, trace how upstream `slub.c` works here:**
+1. **`set_freepointer(obj, next)` and `get_freepointer(obj)`**:
+   Stores/reads the `void *` pointer to the next free slot in the first 8 bytes of `obj`. Because `sizeof(void *) == 8`, this works for **8-byte slots** (`kmalloc-8`) all the way up to `2048-byte slots`!
+2. **`cache_grow(cache)`**:
+   - Calls `alloc_page()` to get a `struct page *page`.
+   - Sets `page->slab_cache = cache;` and `page->inuse = 0;`.
+   - Slices the 4096-byte page into `4096 / obj_size` slots, linking them into `page->freelist` using `set_freepointer()`.
+   - Links `&page->list` into `&cache->partial` using `list_add_tail(&page->list, &cache->partial)`!
+3. **`kmalloc(size)`**:
+   - Finds the bucket `cache = &kmalloc_caches[idx]`.
+   - Takes the first slab page from `cache->partial` (`struct page *page = list_first_entry(&cache->partial, struct page, list)`).
+   - Pops the first object from `page->freelist` using `get_freepointer(obj)` and increments `page->inuse++`.
+   - If `page->freelist == NULL` (all slots in this 4KB page are now in use!), removes `page->list` from `cache->partial` (`list_del(&page->list)`).
+4. **`kfree(ptr)`**:
+   - Finds the `struct page *page = phys_to_page(__pa(ptr))`.
+   - Reads `struct kmem_cache *cache = page->slab_cache;`.
+   - If `cache == NULL`, it was a full 4KB page $\rightarrow$ calls `free_page(page)`.
+   - Otherwise, pushes `ptr` back onto `page->freelist` via `set_freepointer(ptr, page->freelist)` and decrements `page->inuse--`.
+   - If the page was previously 100% full (`was_full`), adds it back to `cache->partial` (`list_add(&page->list, &cache->partial)`).
 
 ```c
 /* Target File: my-linux/mm/slab.c */
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <linux/types.h>
+#include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <asm/pgtable.h>
 
 void early_puts(const char *s);
 
-/* Intrusive pointer stored in the first 8 bytes of every free object slot */
-struct slab_obj {
-    struct slab_obj *next;
-};
-
 /*
- * The 7 power-of-two size-class caches:
- * Index 0: 32 B | 1: 64 B | 2: 128 B | 3: 256 B | 4: 512 B | 5: 1024 B | 6: 2048 B
+ * The 9 power-of-two size-class caches (matching upstream linux/mm/slub.c):
+ * 0: 8B | 1: 16B | 2: 32B | 3: 64B | 4: 128B | 5: 256B | 6: 512B | 7: 1024B | 8: 2048B
  */
 static struct kmem_cache kmalloc_caches[KMALLOC_NUM_CACHES];
 
 /*
- * size_to_cache_index - Find which bucket (0..6) fits 'size' bytes
+ * Upstream linux/mm/slub.c helpers: read/write the next-free-slot pointer
+ * directly in the first 8 bytes of a free object slot.
+ */
+static inline void *get_freepointer(void *object)
+{
+    return *(void **)object;
+}
+
+static inline void set_freepointer(void *object, void *fp)
+{
+    *(void **)object = fp;
+}
+
+/*
+ * size_to_cache_index - Find which bucket (0..8) fits 'size' bytes
  */
 static int size_to_cache_index(size_t size)
 {
-    unsigned int bucket_size = KMALLOC_MIN_SIZE; /* 32 */
+    unsigned int bucket_size = KMALLOC_MIN_SIZE; /* Starts at 8 bytes! */
     for (int i = 0; i < KMALLOC_NUM_CACHES; i++) {
         if (size <= bucket_size) {
             return i;
         }
-        bucket_size <<= 1; /* Multiply by 2: 32 -> 64 -> 128 -> ... */
+        bucket_size <<= 1; /* 8 -> 16 -> 32 -> 64 -> 128 -> 256 -> 512 -> 1024 -> 2048 */
     }
     return -1; /* Larger than 2048 bytes */
 }
 
 /*
- * kmem_cache_init - Initialize the 7 power-of-two kmalloc buckets
+ * kmem_cache_init - Initialize the 9 power-of-two kmalloc buckets (8B .. 2048B)
  */
 void kmem_cache_init(void)
 {
     unsigned int size = KMALLOC_MIN_SIZE;
     for (int i = 0; i < KMALLOC_NUM_CACHES; i++) {
         kmalloc_caches[i].obj_size = size;
-        kmalloc_caches[i].nr_free = 0;
-        kmalloc_caches[i].free_list = NULL;
+        INIT_LIST_HEAD(&kmalloc_caches[i].partial);
         size <<= 1;
     }
-    early_puts("[SLAB] kmalloc size-class caches (32B .. 2048B) initialized.\n");
+    early_puts("[SLAB] Upstream SLUB kmalloc caches (8B .. 2048B) initialized.\n");
 }
 
 /*
- * cache_grow - Allocate one 4KB page and slice it into fixed-size slots
+ * allocate_slab - Allocate one 4KB page, slice into objects, and add to cache->partial
  */
-static int cache_grow(struct kmem_cache *cache)
+static int allocate_slab(struct kmem_cache *cache)
 {
-    struct page *card = alloc_page();
-    if (!card) {
+    struct page *page = alloc_page();
+    if (!page) {
         return -1;
     }
 
-    /* Record the slot size on the page's Index Card so kfree() knows its size! */
-    card->slab_size = cache->obj_size;
+    page->slab_cache = cache;
+    page->inuse = 0;
+    page->freelist = NULL;
 
-    char *page_va = (char *)page_address(card);
+    char *page_va = (char *)page_address(page);
     unsigned int obj_size = cache->obj_size;
     unsigned int count = PAGE_SIZE / obj_size;
 
-    /* Slice the 4096-byte page from back to front so Slot 0 is popped first! */
+    /* Link all slots from back to front so Slot 0 is at the head of page->freelist */
     for (int i = (int)count - 1; i >= 0; i--) {
-        struct slab_obj *obj = (struct slab_obj *)(page_va + (i * obj_size));
-        obj->next = (struct slab_obj *)cache->free_list;
-        cache->free_list = obj;
-        cache->nr_free++;
+        void *obj = (void *)(page_va + (i * obj_size));
+        set_freepointer(obj, page->freelist);
+        page->freelist = obj;
     }
 
+    /* Link this slab page into the cache's partial list using <linux/list.h> */
+    list_add_tail(&page->list, &cache->partial);
     return 0;
 }
 
@@ -354,36 +549,44 @@ void *kmalloc(size_t size)
         return NULL;
     }
 
-    /* If request is larger than 2048 bytes (up to 4096 bytes), allocate a full page */
     int idx = size_to_cache_index(size);
     if (idx < 0) {
         if (size > PAGE_SIZE) {
             early_puts("[SLAB ERROR] kmalloc size exceeds PAGE_SIZE!\n");
             return NULL;
         }
-        struct page *card = alloc_page();
-        if (!card) {
+        struct page *page = alloc_page();
+        if (!page) {
             return NULL;
         }
-        card->slab_size = PAGE_SIZE;
-        return page_address(card);
+        page->slab_cache = NULL; /* Full-page allocation */
+        return page_address(page);
     }
 
     struct kmem_cache *cache = &kmalloc_caches[idx];
 
-    /* If bucket is empty, slice a new 4KB page into slots */
-    if (!cache->free_list) {
-        if (cache_grow(cache) < 0) {
+    /* If no partial slab page is available, allocate a new 4KB slab page */
+    if (list_empty(&cache->partial)) {
+        if (allocate_slab(cache) < 0) {
             return NULL;
         }
     }
 
-    /* Pop the first free slot from the bucket */
-    struct slab_obj *obj = (struct slab_obj *)cache->free_list;
-    cache->free_list = obj->next;
-    cache->nr_free--;
+    /* Get the first partial slab page */
+    struct page *page = list_first_entry(&cache->partial, struct page, list);
 
-    return (void *)obj;
+    /* Pop the first free object from page->freelist */
+    void *object = page->freelist;
+    page->freelist = get_freepointer(object);
+    page->inuse++;
+
+    /* If this slab page is now completely full, remove it from cache->partial */
+    if (page->freelist == NULL) {
+        list_del(&page->list);
+        INIT_LIST_HEAD(&page->list);
+    }
+
+    return object;
 }
 
 /*
@@ -396,7 +599,6 @@ void *kzalloc(size_t size)
         return NULL;
     }
 
-    /* Zero out the requested bytes */
     uint8_t *p = (uint8_t *)ptr;
     for (size_t i = 0; i < size; i++) {
         p[i] = 0;
@@ -405,7 +607,7 @@ void *kzalloc(size_t size)
 }
 
 /*
- * kfree - Return a kmalloc-allocated object back to its size-class bucket
+ * kfree - Return a kmalloc-allocated object back to its slab page
  */
 void kfree(const void *ptr)
 {
@@ -413,73 +615,83 @@ void kfree(const void *ptr)
         return;
     }
 
-    /* 1. Convert Kernel VA -> Physical Address -> struct page Index Card! */
     uintptr_t pa = __pa(ptr);
-    struct page *card = phys_to_page(pa);
-    unsigned int obj_size = card->slab_size;
+    struct page *page = phys_to_page(pa);
+    struct kmem_cache *cache = page->slab_cache;
 
-    /* 2. If it was a full 4KB page allocation, return it to page_alloc */
-    if (obj_size == PAGE_SIZE) {
-        card->slab_size = 0;
-        free_page(card);
+    /* Full-page allocation -> return directly to page allocator */
+    if (!cache) {
+        free_page(page);
         return;
     }
 
-    /* 3. Otherwise, find the matching bucket and push the slot back onto free_list */
-    int idx = size_to_cache_index(obj_size);
-    if (idx < 0) {
-        early_puts("[SLAB ERROR] kfree() called on invalid pointer!\n");
-        return;
-    }
+    int was_full = (page->freelist == NULL);
 
-    struct kmem_cache *cache = &kmalloc_caches[idx];
-    struct slab_obj *obj = (struct slab_obj *)ptr;
-    obj->next = (struct slab_obj *)cache->free_list;
-    cache->free_list = obj;
-    cache->nr_free++;
+    /* Push object back onto the slab page's freelist */
+    set_freepointer((void *)ptr, page->freelist);
+    page->freelist = (void *)ptr;
+    page->inuse--;
+
+    /* If the slab page was previously full, put it back onto cache->partial */
+    if (was_full) {
+        list_add(&page->list, &cache->partial);
+    }
 }
 ```
 
 ---
 
-### Step 4: Test `kmalloc()` and `kfree()` in `my-linux/init/main.c`
+### Step 5: Test High-Half Execution & `kmalloc(8)` in `my-linux/init/main.c`
 
 1. In **`my-linux/Makefile`**, add `mm/slab.c` to `SRCS_C`:
    ```makefile
    SRCS_C  := drivers/tty/serial/8250_early.c init/main.c arch/riscv/kernel/setup.c arch/riscv/kernel/traps.c mm/page_alloc.c arch/riscv/mm/init.c mm/slab.c
    ```
-2. In **`my-linux/init/main.c`**, include `<linux/slab.h>` and add the Slab Allocator verification after `vm_init()`:
+2. In **`my-linux/init/main.c`**, include `<linux/slab.h>` and add the verification after `vm_init()`:
 
 ```c
 /* Target File: my-linux/init/main.c */
 #include <linux/slab.h>
 
 /* Inside start_kernel(), after the MMU tests: */
-    /* 9. Initialize and Test Sub-Page Slab Allocator (kmalloc / kfree) */
-    kmem_cache_init();
-
-    void *obj1 = kzalloc(48); /* Rounds up to 64-byte bucket */
-    void *obj2 = kzalloc(48); /* Should be 64 bytes (+0x40) right after obj1! */
-    early_puts("[SLAB TEST] Allocated two 48B objects (64B bucket):\n  obj1 VA: ");
-    early_print_hex((uintptr_t)obj1);
-    early_puts("\n  obj2 VA: ");
-    early_print_hex((uintptr_t)obj2);
+    /* 9. Verify High-Half Stack Pointer (sp) and Program Counter (PC) */
+    unsigned long current_sp, current_pc;
+    __asm__ volatile("mv %0, sp" : "=r"(current_sp));
+    __asm__ volatile("auipc %0, 0" : "=r"(current_pc));
+    early_puts("[MMU TEST] Current High-Half PC: ");
+    early_print_hex(current_pc);
+    early_puts(" | High-Half SP: ");
+    early_print_hex(current_sp);
     early_puts("\n");
 
-    /* Free obj1, then allocate obj3 (should reuse obj1's exact slot!) */
-    kfree(obj1);
-    void *obj3 = kzalloc(48);
-    if (obj3 == obj1) {
-        early_puts("  [SUCCESS] kfree(obj1) + kzalloc(48) reused exact 64B slot!\n\n");
+    /* 10. Initialize and Test Upstream SLUB Allocator (8B .. 2048B) */
+    kmem_cache_init();
+
+    uint64_t *tiny1 = (uint64_t *)kzalloc(8); /* Uses 8-byte bucket (kmalloc-8)! */
+    uint64_t *tiny2 = (uint64_t *)kzalloc(8); /* Should be exactly +8 bytes after tiny1! */
+    early_puts("[SLAB TEST] Allocated two 8-byte objects (kmalloc-8):\n  tiny1 VA: ");
+    early_print_hex((uintptr_t)tiny1);
+    early_puts("\n  tiny2 VA: ");
+    early_print_hex((uintptr_t)tiny2);
+    early_puts("\n");
+
+    /* Free tiny1, then allocate tiny3 (should reuse tiny1's exact 8B slot!) */
+    kfree(tiny1);
+    uint64_t *tiny3 = (uint64_t *)kzalloc(8);
+    if (tiny3 == tiny1) {
+        early_puts("  [SUCCESS] kfree(tiny1) + kzalloc(8) reused exact 8-byte slot!\n\n");
     }
-    kfree(obj2);
-    kfree(obj3);
+    kfree(tiny2);
+    kfree(tiny3);
 ```
 
 ---
 
 ## PART 4: Plain-Language Feynman Recap
 
-1. **`alloc_page()` is the Wholesale Warehouse**: It hands out whole 4096-byte pages (`struct page *` Index Cards).
-2. **`kmalloc()` is the Retail Store Built on Top**: It takes a single 4096-byte page from `alloc_page()`, slices it into `32`, `64`, `128`, `256`, `512`, `1024`, or `2048` byte slots, and stamps `card->slab_size` onto the page's Index Card.
-3. **`kfree(ptr)` is Automatic Sorting**: It converts `ptr` to its physical address (`__pa(ptr)`), looks up its Index Card (`phys_to_page(pa)`), reads `card->slab_size`, and drops the slot right back into the matching bucket!
+1. **Upstream `relocate_enable_mmu` in `head.S`**: Relocates `ra` (`PC`), `sp`, `s0`, and `stvec` by adding `PAGE_OFFSET` (`0xFFFFFFC000000000UL`) right as `satp` turns on, so the kernel genuinely executes in the High Half!
+2. **Upstream Two-Level SLUB (`mm/slab.c`)**:
+   - **Level 1 (`struct list_head`)**: Links 4KB `struct page` slabs onto `cache->partial`.
+   - **Level 2 (`set_freepointer` / `get_freepointer`)**: Links `8B..2048B` free object slots inside each `page->freelist` with zero extra structs!
+   - **`kfree(ptr)`**: Finds `page = phys_to_page(__pa(ptr))` in $O(1)$ time, reads `page->slab_cache`, and pushes `ptr` right back onto `page->freelist`!
+

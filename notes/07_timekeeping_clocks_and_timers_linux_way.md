@@ -145,21 +145,95 @@ Every time `jiffies_64` ticks upward in the timer interrupt (or in `TIMER_SOFTIR
 
 ---
 
-## PART 4: Step-by-Step Implementation in `my-linux/`
+## PART 4: How Upstream `linux/arch/riscv/kernel/time.c` & `drivers/clocksource/timer-riscv.c` Work
 
-Let's look at the exact files to create/update in `my-linux/` when we reach this step.
+Let's inspect the actual upstream Linux files in `C:\workspace\career_ws\linux`:
+1. **`linux/arch/riscv/kernel/head.S` (line 245)**:
+   Enables the `time` counter CSR via `scounteren`:
+   ```assembly
+   li t0, 0x2
+   csrw scounteren, t0
+   ```
+2. **`linux/arch/riscv/kernel/time.c` (lines 18–45)**:
+   Defines `unsigned long riscv_timebase;` and reads the `"timebase-frequency"` property dynamically from the `/cpus` node in the Device Tree! (No hardcoded `#define RISCV_TIMEBASE_FREQ 10000000`!).
+   Then calculates ticks per jiffy (`lpj_fine = riscv_timebase / HZ;`).
+3. **`linux/drivers/clocksource/timer-riscv.c` (lines 28–152)**:
+   - **`riscv_clock_event_stop()`**: Calls `sbi_set_timer(U64_MAX)` (`~0ULL`) to clear/stop any pending timer interrupt before programming or handling an event.
+   - **`riscv_clock_next_event(unsigned long delta, struct clock_event_device *ce)`**: Reads `rdtime() + delta` and calls `sbi_set_timer(next_tval)`.
+   - **`riscv_clocksource_rdtime(struct clocksource *cs)`**: Returns `rdtime()`.
+   - **`riscv_timer_interrupt()`**: Stops the current event (`riscv_clock_event_stop()`), then invokes `evdev->event_handler(evdev)` (which increments `jiffies_64`, rearms the next tick `riscv_timebase / HZ`, and runs expired `struct timer_list` callbacks!).
 
 ---
 
-### File 1: `my-linux/arch/riscv/include/asm/csr.h` (Interrupt Enable Bits)
+## PART 5: Step-by-Step Implementation in `my-linux/`
 
-**What this file does:**
-Defines the RISC-V Supervisor Status (`sstatus`) and Supervisor Interrupt Enable (`sie`) bits:
-- In `sstatus`: **`SR_SIE` (`1UL << 1`)** is the Master Supervisor Interrupt Enable switch.
-- In `sie`:
-  - **`SIE_SSIE` (`1UL << 1`)**: Supervisor Software Interrupt Enable.
-  - **`SIE_STIE` (`1UL << 5`)**: Supervisor Timer Interrupt Enable.
-  - **`SIE_SEIE` (`1UL << 9`)**: Supervisor External (PLIC) Interrupt Enable.
+Here are the exact files for you to update or create in `my-linux/`.
+
+---
+
+### Step 1: Enable `scounteren` in `my-linux/arch/riscv/kernel/head.S`
+
+**What this change does:**
+Matching `linux/arch/riscv/kernel/head.S` (line 245), setting Bit 1 (`0x2`) in `scounteren` permits reading the hardware `time` CSR (`rdtime`).
+
+Add these two lines right after `csrw sip, zero` in **`my-linux/arch/riscv/kernel/head.S`**:
+```assembly
+/* Target File: my-linux/arch/riscv/kernel/head.S */
+    /* Enable time CSR access (matching upstream linux/arch/riscv/kernel/head.S) */
+    li   t0, 0x2
+    csrw scounteren, t0
+```
+
+---
+
+### Step 2: Dynamically Read `"timebase-frequency"` in `my-linux/arch/riscv/kernel/setup.c`
+
+**What this change does:**
+In `my-linux/arch/riscv/kernel/setup.c`, your `fdt_scan_nodes()` loop already visits every `FDT_PROP` token and gets `const char *prop_name` and the value pointer `p`!
+When `prop_name` matches `"timebase-frequency"`, we read the 32-bit Big-Endian integer `be32_to_cpu(*p)` and store it in **`unsigned long riscv_timebase`** (matching upstream `linux/arch/riscv/kernel/time.c`)!
+
+Add a simple string comparison helper `fdt_streq` and capture `riscv_timebase` in **`my-linux/arch/riscv/kernel/setup.c`**:
+```c
+/* Target File: my-linux/arch/riscv/kernel/setup.c */
+
+void early_print_dec(unsigned long val);
+
+/* Global hardware timebase frequency (ticks/sec) discovered from DTB /cpus */
+unsigned long riscv_timebase = 0;
+
+static int fdt_streq(const char *a, const char *b)
+{
+    while (*a && *b) {
+        if (*a != *b) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+/* Inside fdt_scan_nodes(), inside the 'else if (token == FDT_PROP)' block: */
+        } else if (token == FDT_PROP) {
+            uint32_t prop_len = be32_to_cpu(*p++);
+            uint32_t name_offset = be32_to_cpu(*p++);
+            const char *prop_name = strings + name_offset;
+
+            /* Dynamically extract timebase-frequency from /cpus node! */
+            if (fdt_streq(prop_name, "timebase-frequency") && prop_len == 4) {
+                riscv_timebase = (unsigned long)be32_to_cpu(*p);
+                early_puts("  [FDT] Discovered riscv_timebase = ");
+                early_print_dec(riscv_timebase);
+                early_puts(" Hz\n");
+            }
+
+            /* Advance pointer past property value and 4-byte padding */
+            p += fdt_align4(prop_len) / sizeof(uint32_t);
+```
+
+---
+
+### Step 3: Create `my-linux/arch/riscv/include/asm/csr.h` (Interrupt & Counter Helpers)
 
 ```c
 /* Target File: my-linux/arch/riscv/include/asm/csr.h */
@@ -179,11 +253,11 @@ Defines the RISC-V Supervisor Status (`sstatus`) and Supervisor Interrupt Enable
 #define SIE_SEIE            (1UL << 9)  /* External Interrupt (PLIC) */
 
 /* Interrupt cause codes (without the top bit 63) */
-#define IRQ_S_SOFT          1
-#define IRQ_S_TIMER         5
-#define IRQ_S_EXT           9
+#define RV_IRQ_SOFT         1
+#define RV_IRQ_TIMER        5
+#define RV_IRQ_EXT          9
 
-static inline unsigned long rdtime(void)
+static inline unsigned long get_cycles64(void)
 {
     unsigned long val;
     __asm__ volatile("rdtime %0" : "=r"(val));
@@ -205,7 +279,7 @@ static inline void local_irq_disable(void)
 
 ---
 
-### File 2: `my-linux/include/linux/timer.h` (Linux Timer API)
+### Step 4: Create `my-linux/include/linux/timer.h` (Upstream Linux Timer & Clock Structures)
 
 ```c
 /* Target File: my-linux/include/linux/timer.h */
@@ -219,24 +293,29 @@ static inline void local_irq_disable(void)
 /* Configured OS heartbeat rate: 100 ticks per second (10 ms per jiffy) */
 #define HZ                  100UL
 #define TICK_NSEC           (1000000000UL / HZ)
+#define U64_MAX             (~0ULL)
 
+extern unsigned long riscv_timebase;
 extern volatile uint64_t jiffies_64;
 
 /*
- * struct clocksource - Hardware monotonic free-running counter abstraction
+ * struct clocksource - Upstream Linux monotonic counter abstraction
  */
 struct clocksource {
     const char *name;
+    int rating;
     uint64_t (*read)(struct clocksource *cs);
-    uint32_t freq_hz;
 };
 
 /*
- * struct clock_event_device - Hardware timer interrupt generator abstraction
+ * struct clock_event_device - Upstream Linux timer event generator abstraction
  */
 struct clock_event_device {
     const char *name;
-    int (*set_next_event)(unsigned long delta, struct clock_event_device *evt);
+    int rating;
+    int (*set_next_event)(unsigned long delta, struct clock_event_device *ce);
+    int (*set_state_shutdown)(struct clock_event_device *ce);
+    void (*event_handler)(struct clock_event_device *ce);
 };
 
 /*
@@ -254,19 +333,20 @@ int del_timer(struct timer_list *timer);
 void run_timer_softirq(void);
 
 void time_init(void);
-void timer_interrupt_handler(void);
+void riscv_timer_interrupt(void);
 
 #endif /* _LINUX_TIMER_H */
 ```
 
 ---
 
-### File 3: `my-linux/drivers/clocksource/timer-riscv.c`
+### Step 5: Create `my-linux/drivers/clocksource/timer-riscv.c` (Matching Upstream `timer-riscv.c`)
 
-**Before looking at the code, let's trace how `sbi_set_timer(uint64_t stime_value)` works:**
-1. OpenSBI implements the Timer Extension (`EID = 0x54494D45`, which is the ASCII letters `'T' 'I' 'M' 'E'`).
-2. We put `0x54494D45` in `a7` (Extension ID), `0` in `a6` (Function ID 0 = `sbi_set_timer`), and the 64-bit `stime_value` deadline in `a0`.
-3. We execute `ecall`. OpenSBI traps into M-mode, writes our deadline into the hardware `mtimecmp` register, clears `sip.STIP`, and returns to S-mode!
+**Before writing the code, trace how upstream `drivers/clocksource/timer-riscv.c` works:**
+1. **`riscv_clock_event_stop()`**: Calls `sbi_set_timer(U64_MAX)` (`0xFFFFFFFFFFFFFFFF`) so the hardware comparator is set to infinity and `sip.STIP` is cleared until the next deadline is programmed.
+2. **`riscv_clock_next_event(delta, ce)`**: Reads `next_tval = get_cycles64() + delta` and calls `sbi_set_timer(next_tval)`.
+3. **`riscv_timer_interrupt()`**: Called from `do_trap()` when `scause` is `RV_IRQ_TIMER` (`5`). Just like upstream `timer-riscv.c` (line 145), it calls `riscv_clock_event_stop()` and then invokes `riscv_clock_event.event_handler(&riscv_clock_event)`!
+4. **`tick_handle_periodic(ce)` (our `event_handler`)**: Increments `jiffies_64++`, rearms the next tick (`riscv_timebase / HZ`), and runs any expired `struct timer_list` callbacks!
 
 ```c
 /* Target File: my-linux/drivers/clocksource/timer-riscv.c */
@@ -281,10 +361,6 @@ void early_print_dec(unsigned long val);
 
 /* Global jiffies counter (incremented at HZ = 100 times per second) */
 volatile uint64_t jiffies_64 = 0;
-
-/* QEMU Virt hardware timebase is 10 MHz (10,000,000 ticks/sec) */
-#define RISCV_TIMEBASE_FREQ 10000000UL
-#define TICKS_PER_JIFFY     (RISCV_TIMEBASE_FREQ / HZ) /* 100,000 ticks per 10ms jiffy */
 
 static LIST_HEAD(active_timers);
 
@@ -304,35 +380,86 @@ static void sbi_set_timer(uint64_t stime_value)
 }
 
 /*
- * riscv_clocksource_read - Read monotonic hardware counter ('time' CSR)
+ * riscv_clock_event_stop - Clear pending timer interrupt by setting comparator to U64_MAX
+ * (Matches upstream linux/drivers/clocksource/timer-riscv.c::riscv_clock_event_stop)
  */
-static uint64_t riscv_clocksource_read(struct clocksource *cs)
+static void riscv_clock_event_stop(void)
 {
-    (void)cs;
-    return rdtime();
+    sbi_set_timer(U64_MAX);
 }
 
-struct clocksource riscv_clocksource = {
-    .name    = "riscv_clocksource",
-    .read    = riscv_clocksource_read,
-    .freq_hz = RISCV_TIMEBASE_FREQ,
-};
-
 /*
- * riscv_clock_next_event - Program next timer interrupt 'delta' ticks from now
+ * riscv_clock_next_event - Program next timer interrupt 'delta' counter ticks from now
+ * (Matches upstream linux/drivers/clocksource/timer-riscv.c::riscv_clock_next_event)
  */
-static int riscv_clock_next_event(unsigned long delta, struct clock_event_device *evt)
+static int riscv_clock_next_event(unsigned long delta, struct clock_event_device *ce)
 {
-    (void)evt;
-    uint64_t next_deadline = rdtime() + delta;
-    sbi_set_timer(next_deadline);
+    (void)ce;
+    uint64_t next_tval = get_cycles64() + delta;
+    sbi_set_timer(next_tval);
     return 0;
 }
 
-struct clock_event_device riscv_clockevent = {
-    .name           = "riscv_timer_clockevent",
-    .set_next_event = riscv_clock_next_event,
+static int riscv_clock_shutdown(struct clock_event_device *evt)
+{
+    (void)evt;
+    riscv_clock_event_stop();
+    return 0;
+}
+
+/*
+ * riscv_clocksource_rdtime - Read monotonic hardware counter ('time' CSR)
+ * (Matches upstream linux/drivers/clocksource/timer-riscv.c::riscv_clocksource_rdtime)
+ */
+static uint64_t riscv_clocksource_rdtime(struct clocksource *cs)
+{
+    (void)cs;
+    return get_cycles64();
+}
+
+struct clocksource riscv_clocksource = {
+    .name   = "riscv_clocksource",
+    .rating = 400,
+    .read   = riscv_clocksource_rdtime,
 };
+
+/*
+ * tick_handle_periodic - Generic tick handler registered as ce->event_handler
+ */
+static void tick_handle_periodic(struct clock_event_device *ce)
+{
+    /* 1. Advance the OS heartbeat counter */
+    jiffies_64++;
+
+    /* 2. Rearm hardware comparator for the next jiffy (riscv_timebase / HZ)! */
+    unsigned long ticks_per_jiffy = riscv_timebase / HZ;
+    ce->set_next_event(ticks_per_jiffy, ce);
+
+    /* 3. Run expired dynamic software timers (struct timer_list) */
+    run_timer_softirq();
+}
+
+struct clock_event_device riscv_clock_event = {
+    .name               = "riscv_timer_clockevent",
+    .rating             = 100,
+    .set_next_event     = riscv_clock_next_event,
+    .set_state_shutdown = riscv_clock_shutdown,
+    .event_handler      = tick_handle_periodic,
+};
+
+/*
+ * riscv_timer_interrupt - Low-level timer interrupt handler called from do_trap()
+ * (Matches upstream linux/drivers/clocksource/timer-riscv.c::riscv_timer_interrupt)
+ */
+void riscv_timer_interrupt(void)
+{
+    struct clock_event_device *evdev = &riscv_clock_event;
+
+    riscv_clock_event_stop();
+    if (evdev->event_handler) {
+        evdev->event_handler(evdev);
+    }
+}
 
 /*
  * timer_setup - Initialize a dynamic kernel timer_list struct
@@ -351,8 +478,7 @@ void timer_setup(struct timer_list *timer, void (*callback)(struct timer_list *)
 int mod_timer(struct timer_list *timer, uint64_t expires)
 {
     timer->expires = expires;
-    /* If not already on the active list, add it */
-    if (timer->entry.next == &timer->entry || timer->entry.next == NULL) {
+    if (list_empty(&timer->entry)) {
         list_add_tail(&timer->entry, &active_timers);
     }
     return 0;
@@ -363,7 +489,7 @@ int mod_timer(struct timer_list *timer, uint64_t expires)
  */
 int del_timer(struct timer_list *timer)
 {
-    if (timer->entry.next != &timer->entry && timer->entry.next != NULL) {
+    if (!list_empty(&timer->entry)) {
         list_del(&timer->entry);
         INIT_LIST_HEAD(&timer->entry);
         return 1;
@@ -393,29 +519,24 @@ void run_timer_softirq(void)
 }
 
 /*
- * timer_interrupt_handler - Called from do_trap() on IRQ_S_TIMER (scause = 5)
- */
-void timer_interrupt_handler(void)
-{
-    /* 1. Advance the OS heartbeat counter */
-    jiffies_64++;
-
-    /* 2. Rearm hardware comparator for the next 10ms jiffy! */
-    riscv_clockevent.set_next_event(TICKS_PER_JIFFY, &riscv_clockevent);
-
-    /* 3. Run expired software timers */
-    run_timer_softirq();
-}
-
-/*
- * time_init - Arm the first timer tick and enable Supervisor Timer Interrupts
+ * time_init - Verify DTB timebase, arm first tick, and enable Supervisor Timer Interrupts
+ * (Matches upstream linux/arch/riscv/kernel/time.c::time_init & riscv_timer_starting_cpu)
  */
 void time_init(void)
 {
-    early_puts("[TIME] Initializing RISC-V clocksource (10 MHz) & clockevent (HZ=100)...\n");
+    if (riscv_timebase == 0) {
+        early_puts("[TIME PANIC] No timebase-frequency discovered in DTB!\n");
+        return;
+    }
 
-    /* Schedule the very first tick 100,000 counter ticks (10 ms) from now */
-    riscv_clockevent.set_next_event(TICKS_PER_JIFFY, &riscv_clockevent);
+    unsigned long ticks_per_jiffy = riscv_timebase / HZ;
+    early_puts("[TIME] Initializing RISC-V clocksource & clockevent (ticks_per_jiffy = ");
+    early_print_dec(ticks_per_jiffy);
+    early_puts(")...\n");
+
+    /* Clear any pending timer interrupt and arm the first tick */
+    riscv_clock_event_stop();
+    riscv_clock_event.set_next_event(ticks_per_jiffy, &riscv_clock_event);
 
     /* Enable Supervisor Timer Interrupt bit (SIE_STIE) in sie CSR */
     unsigned long sie_val = SIE_STIE;
@@ -430,19 +551,20 @@ void time_init(void)
 
 ---
 
-### File 4: Update `my-linux/arch/riscv/kernel/traps.c` to Route Timer Interrupts
+### Step 6: Update `my-linux/arch/riscv/kernel/traps.c` to Call `riscv_timer_interrupt()`
 
-Inside `do_trap()` in **`my-linux/arch/riscv/kernel/traps.c`**, when `is_interrupt` is true and `code == 5` (`IRQ_S_TIMER`), call `timer_interrupt_handler()`:
+Inside `do_trap()` in **`my-linux/arch/riscv/kernel/traps.c`**, when `is_interrupt` is true and `code == RV_IRQ_TIMER` (`5`), call `riscv_timer_interrupt()`:
 
 ```c
 /* Target File: my-linux/arch/riscv/kernel/traps.c */
 #include <linux/timer.h>
+#include <asm/csr.h>
 
 /* Inside do_trap(struct pt_regs *regs): */
     if (is_interrupt) {
-        if (code == 5) {
-            /* Supervisor Timer Interrupt (IRQ_S_TIMER) */
-            timer_interrupt_handler();
+        if (code == RV_IRQ_TIMER) {
+            /* Supervisor Timer Interrupt (scause = 5) */
+            riscv_timer_interrupt();
         } else {
             early_puts("[TRAP] Supervisor Interrupt received!\n");
         }
@@ -451,9 +573,9 @@ Inside `do_trap()` in **`my-linux/arch/riscv/kernel/traps.c`**, when `is_interru
 
 ---
 
-## PART 5: Plain-Language Feynman Recap
+## PART 6: Plain-Language Feynman Recap
 
-1. **`timebase-frequency` (10 MHz)** is how fast the silicon stopwatch ticks (`10,000,000` times/sec).
+1. **`riscv_timebase` (10 MHz)** is discovered dynamically from the Device Tree `/cpus` `"timebase-frequency"` property (matching `linux/arch/riscv/kernel/time.c`), never hardcoded!
 2. **`HZ` (100)** is our chosen OS heartbeat rate (`100` interrupts/sec = `10 ms` per jiffy).
-3. **`TICKS_PER_JIFFY` (`100,000`)** is `10,000,000 / 100`—how far ahead we set the alarm on each tick!
-4. **`struct clocksource`** reads `rdtime`; **`struct clock_event_device`** sets the next alarm via `sbi_set_timer()`; **`struct timer_list`** lets any driver schedule callbacks in the future using `jiffies_64`!
+3. **`ticks_per_jiffy = riscv_timebase / HZ` (`100,000`)** is how far ahead `riscv_clock_next_event()` sets the alarm on each tick.
+4. **`riscv_clocksource`** reads `get_cycles64()` (`rdtime`); **`riscv_clock_event`** stops/arms the hardware comparator via `sbi_set_timer()` and invokes `event_handler` (`tick_handle_periodic`); **`struct timer_list`** lets any driver schedule callbacks in the future using `jiffies_64`!
