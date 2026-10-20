@@ -149,85 +149,251 @@ WHY UPSTREAM LINUX'S TWO-LEVEL DESIGN IS SO CLEAN:
 
 ## PART 2: Relocating Kernel Execution (`PC`, `sp`, `stvec`) to the High Half — The Exact Upstream `head.S` Way!
 
-### 1. How Does Upstream `linux/arch/riscv/kernel/head.S` Relocate `PC`, `sp`, and `stvec`?
+### 1. Why Did `PC` Revert to `0x000000008020xxxx` When `vm_init()` Was Called Inside `start_kernel()`?
 
-Let's look at the actual upstream Linux code in `C:\workspace\career_ws\linux\arch\riscv\kernel\head.S` (lines 72–118: `relocate_enable_mmu`).
+Earlier, you saw this super interesting output when `vm_init()` was called inside `start_kernel()`:
+```text
+[MMU TEST] Current High-Half PC: 0x000000008020078a | High-Half SP: 0xffffffc080207fc0
+```
+Why was `SP` in the High Half (`0xffffffc080207fc0`), while `PC` reverted back to the Low Half (`0x000000008020078a`)?
 
-When our kernel boots, `_start` is running at Low-Half physical/identity addresses (`0x000000008020xxxx`).
-After `vm_init()` builds `swapper_pg_dir` (which maps **both** Low-Half `0x000000008020xxxx` and High-Half `0xFFFFFFC08020xxxx`), how does upstream Linux switch the CPU registers (`PC`, `ra`, `sp`, `s0`, and `stvec`) from `0x000000008020xxxx` up to `0xFFFFFFC08020xxxx`?
-
-Upstream Linux writes a clean assembly function **`relocate_enable_mmu(pgd_t root_pgd)`** in **`arch/riscv/kernel/head.S`**!
-
-#### Why Does Upstream Linux Put `relocate_enable_mmu` in `head.S` Instead of Inline Assembly in C?
-Because if you change `sp` (Stack Pointer) and `s0` (Frame Pointer) in the middle of a C function, the C compiler does not know you moved the stack!
-When `relocate_enable_mmu` is a dedicated assembly function in `head.S`:
-1. **`a0` input**: Holds the physical address of `swapper_pg_dir`.
-2. **Step 1 — Relocate Return Address (`ra`) to High Half**:
-    loads `t1 = PAGE_OFFSET` (`0xFFFFFFC000000000UL`) and adds it to `ra`:
-   `add ra, ra, t1`
-   Now `ra` holds the High-Half return address (`0xFFFFFFC08020xxxx`)!
-3. **Step 2 — Relocate Stack Pointer (`sp`) and Frame Pointer (`s0`) to High Half**:
-   `add sp, sp, t1`
-   `beqz s0, 1f; add s0, s0, t1; 1:`
-4. **Step 3 — Point `stvec` to the High-Half Address of `handle_exception`**:
-   `la t0, handle_exception`
-   `add t0, t0, t1`
-   `csrw stvec, t0`
-5. **Step 4 — Compute and Load `satp` (`SATP_MODE_SV39 | (root_phys >> 12)`)**:
-   `srli a0, a0, 12`
-   `li t2, (8 << 60)`
-   `or a0, a0, t2`
-   `sfence.vma zero, zero`
-   `csrw satp, a0`
-   `sfence.vma zero, zero`
-6. **Step 5 — Return (`ret`)**:
-   When `ret` executes, the CPU jumps `PC` to `ra` (`0xFFFFFFC08020xxxx`)!
-   At that exact instant, **`PC`, `sp`, `s0`, and `stvec` are all executing in the High Half (`0xFFFFFFC08020xxxx`)!**
+Let's trace the 3 nested function calls and their saved Return Addresses (`ra`) on the stack!
 
 ```text
-VISUAL TRACE OF UPSTREAM relocate_enable_mmu IN arch/riscv/kernel/head.S:
+WHY CALLING relocate_enable_mmu 3 FUNCTIONS DEEP REVERTED PC:
 
-  Caller: enable_mmu() in arch/riscv/mm/init.c (at Low-Half PC = 0x80200300)
-          Calls relocate_enable_mmu(root_phys)
-                   |
-                   v
-  +-----------------------------------------------------------------------+
-  | Inside relocate_enable_mmu (arch/riscv/kernel/head.S):                |
-  |   t1 = 0xFFFFFFC000000000 (PAGE_OFFSET)                               |
-  |   1. ra    = ra + t1    ---> 0xFFFFFFC080200304 (High-Half Return PC) |
-  |   2. sp    = sp + t1    ---> 0xFFFFFFC080207FE0 (High-Half Stack!)    |
-  |   3. s0    = s0 + t1    ---> 0xFFFFFFC080207FF0 (High-Half Frame Ptr) |
-  |   4. stvec = handle_exception + t1 ---> High-Half Trap Vector!        |
-  |   5. csrw satp, a0; sfence.vma     ---> Sv39 MMU Active!              |
-  |   6. ret                           ---> Jumps PC to High-Half 'ra'!   |
-  +-----------------------------------------------------------------------+
-                   |
-                   v
-  Back in enable_mmu():
-    - CPU is now executing at High-Half PC = 0xFFFFFFC080200304!
-    - Stack Pointer (sp) is at High-Half 0xFFFFFFC080207FE0!
-    - Trap Vector (stvec) is at High-Half 0xFFFFFFC08020xxxx!
+  1. start_kernel() (at Low-Half PC = 0x80200780) calls vm_init():
+     - vm_init()'s function prologue saves start_kernel()'s return address
+       (0x0000000080200784) ON THE STACK (`sd ra, 24(sp)`)!
+
+  2. vm_init() (at Low-Half PC = 0x80200500) calls enable_mmu():
+     - enable_mmu()'s function prologue saves vm_init()'s return address
+       (0x0000000080200504) ON THE STACK (`sd ra, 8(sp)`)!
+
+  3. enable_mmu() calls relocate_enable_mmu():
+     - relocate_enable_mmu() adds PAGE_OFFSET to register 'ra' and returns!
+     - Inside enable_mmu(), PC IS now in the High Half!
+     - BUT when enable_mmu() finishes (`ld ra, 8(sp); ret`) and when vm_init()
+       finishes (`ld ra, 24(sp); ret`), they pop the OLD Low-Half return
+       addresses (`0x0000000080200784`) off the stack and jump PC right back
+       to the Low Half!
 ```
 
-### 2. Wait — What About `mem_map` and `free_page_list` After We Jump to High Half?
-Think carefully!
-Before `enable_mmu()` ran, `mm_init()` initialized:
-- `mem_map` = `0x0000000080208000` (Low-Half address).
-- Because our Low-Half identity map (`0x80200000..0x88000000`) is **still mapped** in `swapper_pg_dir` alongside the High-Half map, those pointers still work, OR we can relocate `mem_map` to the High Half inside `mm_init()` by calling `vm_init()` right after `mm_init()`, or adding `PAGE_OFFSET`!
-Even simpler: if we relocate `mem_map` and `free_page_list` (or keep Low-Half identity mapped until user processes start), let's see what happens when `phys_to_page(pa)` and `page_to_pfn(page)` run:
-- Look at `page_to_pfn(page)` in `include/linux/mm.h`:
-  ```c
-  return (unsigned long)(page - mem_map);
-  ```
-  Notice that `page_to_pfn` subtracts `page - mem_map`!
-  As long as `page` comes from `pfn_to_page(pfn)` (`&mem_map[pfn]`), `page` and `mem_map` are in the same address space!
-  And if we update `mem_map` and `free_page_list` to High-Half in `enable_mmu()` (or call a 5-line helper `mm_relocate_high_half(PAGE_OFFSET)` in `mm/page_alloc.c`), then **even `struct page *` pointers live in `0xFFFFFFC08020xxxx`**!
+### 2. How Does Upstream `linux/arch/riscv/kernel/head.S` Solve This Permanently?
+
+Let's look at `C:\workspace\career_ws\linux\arch\riscv\kernel\head.S` (lines 285–315)!
+In upstream Linux (and ARM64 Linux `arch/arm64/kernel/head.S`), the kernel **NEVER** turns on the MMU inside `start_kernel()`!
+Instead, **`head.S` calls `setup_vm` and `relocate_enable_mmu` BEFORE calling `start_kernel()`**—when there are **ZERO C stack frames on the stack**!
+
+```text
+UPSTREAM LINUX BOOT FLOW IN arch/riscv/kernel/head.S:
+
+  _start (in head.S, running at Physical 0x80200000, MMU OFF):
+    |
+    +-- 1. Mask interrupts (sie = 0, sip = 0) & Park secondary harts
+    +-- 2. Set sp = bss_stack_top & Clear BSS (__bss_start .. __bss_stop)
+    +-- 3. Save a0 (hartid) in s1, and a1 (dtb physical address) in s2
+    |
+    +-- 4. call setup_vm
+    |      (Runs in C while MMU is OFF: calls mm_init() and builds swapper_pg_dir
+    |       with Identity + High-Half mappings, returns root_phys in a0!)
+    |
+    +-- 5. call relocate_enable_mmu
+    |      (Turns ON satp! Adds PAGE_OFFSET 0xFFFFFFC000000000 to ra, sp, and stvec!
+    |       When 'ret' executes, PC jumps to High-Half 0xFFFFFFC0802000xx in head.S!)
+    |
+    +-- 6. call finish_mmu_relocation
+    |      (Updates va_pa_offset = PAGE_OFFSET, swapper_pg_dir, and mem_map to High Half!)
+    |
+    +-- 7. Restore a0 = s1 (hartid) and a1 = s2 + PAGE_OFFSET (High-Half DTB VA!)
+    |
+    +-- 8. tail start_kernel
+           (Enters start_kernel() at High-Half PC = 0xFFFFFFC08020xxxx from Line 1!)
+```
+
+### 3. Advantages vs. Disadvantages & How Other Embedded OSes/RTOSes Do It
+
+```text
++-----------------------------------+---------------------------------------+---------------------------------------+
+| Feature                           | Approach A: Enable MMU inside         | Approach B: Enable MMU in head.S      |
+|                                   | start_kernel()                        | before start_kernel() (Upstream Linux)|
++-----------------------------------+---------------------------------------+---------------------------------------+
+| 1. Call Stack & Return Addresses  | AWKWARD: Caller stack frames hold old | 100% CLEAN: Zero C frames on stack    |
+|    (ra / PC / sp)                 | Low-Half 'ra' values on the stack!    | when MMU turns on! start_kernel() and |
+|                                   |                                       | all functions run at High-Half PC!    |
++-----------------------------------+---------------------------------------+---------------------------------------+
+| 2. Pointer Consistency (dtb,      | MIXED: Code before vm_init() sees     | 100% UNIFORM: Every subsystem in      |
+|    mem_map, global pointers)      | Low-Half pointers; code after sees    | start_kernel() sees ONLY High-Half    |
+|                                   | High-Half pointers.                   | pointers (0xFFFFFFC08xxxxxxx) always! |
++-----------------------------------+---------------------------------------+---------------------------------------+
+| 3. How Other Embedded OSes Do It  | - MCU RTOS (FreeRTOS/Zephyr Cortex-M):| - Linux (RISC-V & ARM64): Always in   |
+|    (Interview Reference!)         |   No MMU (uses MPU), VA == PA forever.|   head.S before start_kernel()!       |
+|                                   | - App-Core RTOS (Zephyr ARM64/RV64):  | - QNX / BSD / Windows: Always in      |
+|                                   |   Enables MMU in reset.S before C!    |   early boot stub before main kernel! |
++-----------------------------------+---------------------------------------+---------------------------------------+
+```
 
 ---
 
-## PART 3: Step-by-Step Implementation in `my-linux/`
+### 4. Bonus: Explaining the Inline Assembly Syntax (`mv` vs `li`/`la` and `auipc`)
 
-Here are the exact files for you to update or create in `my-linux/`.
+In `main.c`, we inspect our current `sp` and `PC` registers using these two lines:
+```c
+__asm__ volatile("mv %0, sp"    : "=r"(current_sp));
+__asm__ volatile("auipc %0, 0"  : "=r"(current_pc));
+```
+
+1. **What does `: "=r"(current_sp)` and `%0` mean?**
+   - `"=r"(current_sp)` tells GCC: *"Pick any general-purpose CPU register (like `a5`) as Write-Only Output `#0` (`%0`), and store its final value into the C variable `current_sp`."*
+   - `%0` inside the string is replaced by that register (`mv a5, sp`).
+2. **Why `mv %0, sp` instead of `li` or `la`?**
+   - **`mv` (Move Register)**: Copies the value inside **CPU register `sp`** into **CPU register `%0`**.
+   - **`li` (Load Immediate)**: Only works for fixed compile-time numbers (like `li a5, 42`), NOT registers!
+   - **`la` (Load Address)**: Only works for global C variable/function symbol names (like `la a5, _start`), NOT registers!
+3. **What does `auipc %0, 0` do?**
+   - RISC-V does not allow `mv %0, pc` because `pc` is not one of the 32 general-purpose registers (`x0..x31`).
+   - **`auipc rd, imm`** (**A**dd **U**pper **I**mmediate to **PC**) computes `rd = Current_PC + (imm << 12)`.
+   - When `imm` is `0`, `auipc %0, 0` computes `%0 = Current_PC + 0`, copying the exact current **Program Counter (`PC`)** into `current_pc`!
+
+---
+
+## PART 3: What You Need to Update Next in `my-linux/` (Industry-Standard `head.S` Flow!)
+
+Since you already implemented `slab.h` and `slab.c` and verified `kmalloc-8`, here are the **3 clean updates** in `my-linux/` to move `setup_vm` + `relocate_enable_mmu` into `head.S` (matching upstream `linux/arch/riscv/kernel/head.S`) so that `Current High-Half PC` prints `0xffffffc08020xxxx`!
+
+---
+
+### Update 1: Update `_start` in `my-linux/arch/riscv/kernel/head.S`
+
+**What this change does:**
+In `head.S`, after clearing BSS and setting `li s0, 0`:
+1. Saves `a0` (`hartid`) into `s1`, and `a1` (`dtb` physical address) into `s2`.
+2. Calls `setup_vm` (which initializes `mm_init` and builds `swapper_pg_dir` while `satp = 0`, returning `root_phys` in `a0`).
+3. Loads `a1 = 0xFFFFFFC000000000` (`PAGE_OFFSET`) and calls `relocate_enable_mmu`.
+   - When `relocate_enable_mmu` executes `ret`, **`PC`, `sp`, and `stvec` are NOW in the High Half (`0xffffffc08020xxxx`)**!
+4. Calls `finish_mmu_relocation` (which updates `va_pa_offset`, `swapper_pg_dir`, and `mem_map` to the High Half).
+5. Restores `a0 = s1` (`hartid`) and `a1 = s2 + PAGE_OFFSET` (High-Half `dtb` pointer!), clears `s1` and `s2`, and executes `tail start_kernel`!
+
+Update `clear_bss_done:` in **`my-linux/arch/riscv/kernel/head.S`**:
+
+```assembly
+/* Target File: my-linux/arch/riscv/kernel/head.S */
+
+clear_bss_done:
+    /* Clear frame pointer */
+    li   s0, 0
+
+    /* Set early Low-Half trap vector while MMU is still off */
+    la   t0, handle_exception
+    csrw stvec, t0
+
+    /* Save boot arguments: s1 = hartid (a0), s2 = dtb physical address (a1) */
+    mv   s1, a0
+    mv   s2, a1
+
+    /* 1. Build page tables in C while MMU is OFF (returns root_phys in a0) */
+    call setup_vm
+
+    /* 2. Turn ON Sv39 MMU and relocate PC (ra), sp, and stvec to High Half! */
+    li   a1, 0xffffffc000000000
+    call relocate_enable_mmu
+
+    /*
+     * RIGHT HERE: CPU PC, sp, and stvec are NOW in High Half (0xffffffc08020xxxx)!
+     * 3. Update C global pointers (va_pa_offset, swapper_pg_dir, mem_map) to High Half
+     */
+    call finish_mmu_relocation
+
+    /* 4. Restore a0 = hartid, and convert a1 = dtb + PAGE_OFFSET (High-Half VA!) */
+    mv   a0, s1
+    li   t0, 0xffffffc000000000
+    add  a1, s2, t0
+    li   s1, 0
+    li   s2, 0
+
+    /* 5. Enter start_kernel(hartid, dtb_va) in High Half! */
+    tail start_kernel
+```
+
+---
+
+### Update 2: Split `setup_vm()` and `finish_mmu_relocation()` in `my-linux/arch/riscv/mm/init.c`
+
+**What this change does:**
+In `my-linux/arch/riscv/mm/init.c`, instead of calling `vm_init()` from `main.c`, `head.S` calls:
+1. **`uintptr_t setup_vm(void)`**: Runs while `satp = 0`. Calls `mm_init((uintptr_t)_end, 0x88000000UL)`, allocates `swapper_pg_dir`, maps the Identity and High-Half Linear ranges, and returns `root_phys` (`__pa(swapper_pg_dir)`) in register `a0` for `relocate_enable_mmu`!
+2. **`void finish_mmu_relocation(void)`**: Runs immediately after `relocate_enable_mmu` when `PC` and `sp` are already in the High Half! Sets `va_pa_offset = PAGE_OFFSET`, updates `swapper_pg_dir` to its High-Half VA, and calls `mm_relocate_high_half(PAGE_OFFSET)`.
+
+Update `enable_mmu` / `vm_init` in **`my-linux/arch/riscv/mm/init.c`** (and update prototypes in **`my-linux/arch/riscv/include/asm/pgtable.h`** if desired):
+
+```c
+/* Target File: my-linux/arch/riscv/mm/init.c */
+
+extern char _end[];
+static uintptr_t saved_root_phys = 0;
+
+/*
+ * setup_vm - Called from head.S while MMU is OFF (satp = 0).
+ * Initializes page_alloc, builds Identity + High-Half page tables,
+ * and returns the physical address of swapper_pg_dir in a0.
+ */
+uintptr_t setup_vm(void)
+{
+    /* 1. Initialize physical page allocator while MMU is off */
+    mm_init((uintptr_t)_end, 0x88000000UL);
+
+    /* 2. Allocate root page table (swapper_pg_dir) */
+    struct page *root_page = alloc_page();
+    if (!root_page) {
+        early_puts("[MMU PANIC] Failed to allocate swapper_pg_dir!\n");
+        return 0;
+    }
+    swapper_pg_dir = (pgd_t)page_address(root_page);
+    saved_root_phys = __pa(swapper_pg_dir);
+
+    /* 3. Low-Half Identity Map (Rows 0..255) for boot transition and UART MMIO */
+    map_page(swapper_pg_dir, 0x10000000UL, 0x10000000UL, PAGE_KERNEL_RW);
+    map_range(swapper_pg_dir, (uintptr_t)_stext, (uintptr_t)_etext, PAGE_KERNEL_EXEC);
+    map_range(swapper_pg_dir, (uintptr_t)_srodata, (uintptr_t)_erodata, PAGE_KERNEL_RO);
+    map_range(swapper_pg_dir, (uintptr_t)_sdata, 0x88000000UL, PAGE_KERNEL_RW);
+
+    /* 4. High-Half Kernel Linear Map (Rows 256..511): VA 0xFFFFFFC080000000 -> PA 0x80000000 */
+    create_linear_mapping_range(swapper_pg_dir, (uintptr_t)_stext, (uintptr_t)_etext, PAGE_KERNEL_EXEC);
+    create_linear_mapping_range(swapper_pg_dir, (uintptr_t)_srodata, (uintptr_t)_erodata, PAGE_KERNEL_RO);
+    create_linear_mapping_range(swapper_pg_dir, (uintptr_t)_sdata, 0x88000000UL, PAGE_KERNEL_RW);
+
+    return saved_root_phys;
+}
+
+/*
+ * finish_mmu_relocation - Called from head.S immediately after relocate_enable_mmu.
+ * At this point, PC, sp, and stvec are ALREADY in the High Half (0xFFFFFFC08020xxxx)!
+ */
+void finish_mmu_relocation(void)
+{
+    va_pa_offset = PAGE_OFFSET;
+    swapper_pg_dir = (pgd_t)__va(saved_root_phys);
+    mm_relocate_high_half(PAGE_OFFSET);
+}
+```
+
+---
+
+### Update 3: Update `start_kernel()` in `my-linux/init/main.c`
+
+**What this change does:**
+Because `head.S` already ran `setup_vm()`, `relocate_enable_mmu()`, and `finish_mmu_relocation()` before calling `start_kernel()`, remove `mm_init(...)` and `vm_init()` from `start_kernel()`!
+And look what happens to `&a` inside `start_kernel()` now:
+- Because `PC` is already at `0xffffffc08020xxxx`, PC-relative addressing (`-mcmodel=medany`) makes `&a` **already a High-Half Virtual Address (`0xffffffc08020xxxx`)**!
+- And `Current High-Half PC` and `High-Half SP` both print `0xffffffc08020xxxx`!
+
+In **`my-linux/init/main.c`**:
+1. Remove the `mm_init(mem_start, mem_end);` and `vm_init();` calls inside `start_kernel()`.
+2. Run `make clean && make qemu` and look at the output:
+   - `Current High-Half PC` will now print **`0xffffffc080200xxx`**!
+   - `High-Half SP` will print **`0xffffffc080207xxx`**!
+   - `Global 'a'` address `&a` will naturally be **`0xffffffc08020xxxx`**!
+   - Even the `dtb` pointer passed into `start_kernel(hartid, dtb)` is now in the High Half (`0xffffffc087e00000`)!
 
 ---
 
@@ -282,29 +448,10 @@ In **`my-linux/mm/page_alloc.c`**:
     */
    void mm_relocate_high_half(unsigned long offset)
    {
-       /* 1. Relocate all next/prev pointers in the circular free_page_list */
-       struct list_head *curr = &free_page_list;
-       do {
-           struct list_head *next_low = curr->next;
-           if (curr->next != &free_page_list) {
-               curr->next = (struct list_head *)((uintptr_t)curr->next + offset);
-           }
-           if (curr->prev != &free_page_list) {
-               curr->prev = (struct list_head *)((uintptr_t)curr->prev + offset);
-           }
-           curr = next_low;
-       } while (curr != &free_page_list);
+       /* 1. Move the mem_map cabinet base pointer to High-Half (0xFFFFFFC080208000) */
+       mem_map = (struct page *)((uintptr_t)mem_map + offset);
 
-       /* 2. Relocate the mem_map base pointer itself to High Half */
-       mem_map = (struct page *)((uintptr_t)mem_map + offset);
-   }
-   ```
-   *(Notice how clever that is: because `free_page_list` itself is a global variable in `.data`, once `PC` jumps to the High Half in `-mcmodel=medany`, `&free_page_list` automatically resolves to its High-Half address! Better yet, if we re-thread `free_page_list` cleanly after moving `mem_map`, let's see how easy a 5-line re-init of the `next`/`prev` pointers is:)*
-   ```c
-   /* Even simpler and 100% bug-free way to relocate free_page_list in mm/page_alloc.c: */
-   void mm_relocate_high_half(unsigned long offset)
-   {
-       mem_map = (struct page *)((uintptr_t)mem_map + offset);
+       /* 2. Re-thread all FREE pages (refcount == 0) onto the High-Half free_page_list */
        INIT_LIST_HEAD(&free_page_list);
        for (unsigned long pfn = min_low_pfn; pfn < max_pfn; pfn++) {
            struct page *page = pfn_to_page(pfn);
@@ -314,10 +461,6 @@ In **`my-linux/mm/page_alloc.c`**:
        }
    }
    ```
-   Look at those 8 lines!
-   - `mem_map` moves to High-Half `0xFFFFFFC080208000`.
-   - `INIT_LIST_HEAD(&free_page_list)` uses the current High-Half `&free_page_list` address.
-   - The `for` loop re-links every unallocated page (`page->refcount == 0`) using its new High-Half `&mem_map[pfn].list` address! Zero pointer-aliasing bugs!
 
 ---
 
