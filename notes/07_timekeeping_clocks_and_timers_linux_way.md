@@ -1,13 +1,124 @@
-# Timekeeping, Clocksource vs. Clockevents & Dynamic Kernel Timers (`timer_list`)
+# Timekeeping, Hardware `stimecmp` (`Sstc`), & Interrupt Top-Half vs. Bottom-Half (`softirq`)
 
-This guide covers **Milestone 5: Time and IRQ Pipeline** in the upstream Linux kernel way:
-1. **The 12-Year-Old Clock Math (`timebase-frequency` vs. `HZ`)** — Why `HZ` is an OS configuration choice (`100`, `250`, or `1000`), NOT a hardware number derived from `10 MHz`!
-2. **`struct clocksource` vs. `struct clock_event_device`** — How Linux separates *reading the current time* (`rdtime`) from *setting the next alarm interrupt* (`sbi_set_timer` / `Sstc`).
-3. **`jiffies_64` and Dynamic Kernel Timers (`struct timer_list`)** — How drivers schedule callbacks in the future (`timer_setup`, `mod_timer`, `del_timer`) without blocking the CPU!
+This guide covers **Milestone 5: Time, Hardware `stimecmp`, and Softirq Bottom-Half Pipeline** in the upstream Linux kernel way:
+1. **Bare-Metal (`-bios none` at `0x80000000`) vs. OpenSBI (`-bios default` at `0x80200000`) Dual-Boot** — How to unlock PMP, trap delegation, and the modern **`stimecmp` (`Sstc` CSR `0x14D`)** in Machine Mode yourself!
+2. **The 12-Year-Old Clock Math (`timebase-frequency` vs. `HZ`)** — Why `HZ` (`100`) is an OS configuration choice (`100,000` ticks per `10 ms` jiffy), NOT a hardware number derived from `10 MHz`!
+3. **`struct clocksource` vs. `struct clock_event_device` Using Modern `stimecmp` (`CSR 0x14D`)** — How modern RISC-V CPUs program the next timer deadline directly in S-mode in **1 instruction** (`csrw stimecmp, next_tval`) with zero M-mode `ecall` overhead!
+4. **Interrupt Top-Half vs. Bottom-Half (`kernel/softirq.c`: `TIMER_SOFTIRQ`)** — Why Linux splits every interrupt into a fast **Top Half** (Hard IRQ) and a deferred **Bottom Half** (`softirq`), and how `struct timer_list` callbacks execute in `TIMER_SOFTIRQ`!
 
 ---
 
-## PART 1: The Clock Math Explained to a 12-Year-Old (`timebase-frequency` vs. `HZ`)
+## PART 1: Answering Your 2 Foundational Boot Questions!
+
+### Question 1: "With `-bios none`, doesn't the CPU start at `0x80000000`? How could `vmlinux` linked at `0x80200000` work, or should `-bios none` start at `0x80000000`?"
+
+You are **100% right** about real silicon and raw binary images!
+Let's explain what happens in both cases in simple terms:
+
+```text
+CASE A: Real Silicon / Raw Binary Image (.bin) with No OpenSBI (-bios none)
+  - On real hardware (or when passing a raw binary to QEMU), the reset ROM at
+    0x1000 ALWAYS jumps to the start of RAM: 0x80000000!
+  - Because OpenSBI is NOT there, our kernel MUST be linked at 0x80000000!
+
+CASE B: Why QEMU's '-kernel vmlinux' (ELF file) Can Jump to Any Address
+  - When you pass an ELF file ('vmlinux') to QEMU's '-kernel' flag, QEMU has a
+    built-in ELF loader that reads 'ENTRY(_start)' from the ELF header and
+    rewrites the target address at 0x1018 in the reset ROM!
+  - HOWEVER, relying on QEMU's ELF loader to jump to 0x80200000 with '-bios none'
+    is a simulator shortcut! On real bare-metal hardware, without OpenSBI at
+    0x80000000, the first stage at RAM base MUST live at 0x80000000!
+```
+
+#### How We Do It Cleanly in `my-linux/arch/riscv/kernel/vmlinux.lds.S`:
+Because `vmlinux.lds.S` is preprocessed by the C preprocessor (`gcc -E`), we use `#ifdef CONFIG_RISCV_M_MODE`:
+```ld
+#ifdef CONFIG_RISCV_M_MODE
+    . = 0x80000000;     /* Bare-Metal (-bios none): Starts right at RAM base 0x80000000! */
+#else
+    . = 0x80200000;     /* OpenSBI (-bios default): Starts at 0x80200000 after OpenSBI!  */
+#endif
+```
+Look how clean that is:
+- When you run **`make qemu-baremetal`** (`-DCONFIG_RISCV_M_MODE` with `-bios none`), `vmlinux` is linked at **`0x80000000`** and runs our M-mode bare-metal setup (`mstatus`, `medeleg`, `mideleg`, `pmpaddr0`, `pmpcfg0`, `mcounteren`, `menvcfg.STCE`, `mret`)!
+- When you run **`make qemu`** (with `-bios default`), `vmlinux` is linked at **`0x80200000`** and boots via OpenSBI!
+
+---
+
+### Question 2: Generic Boot Process of a Bare-Metal Microcontroller vs. an Application Processor (From Power-On to OS!)
+
+In interviews, being able to contrast a **Microcontroller (MCU)** boot flow against an **Application Processor (SoC)** boot flow in simple English sets you apart immediately.
+
+Here is the complete picture from the moment electricity hits the chip:
+
+```text
+===================================================================================
+TYPE 1: MICROCONTROLLER (MCU) — e.g., STM32 Cortex-M4 or Small RISC-V RV32 MCU
+        (Runs Bare-Metal Firmware or RTOS like Zephyr / FreeRTOS)
+===================================================================================
+
+  [1. Power-On Reset]
+      - Electricity stabilizes; hardware reset pin goes HIGH.
+      - Built-in On-Chip SRAM (e.g., 128 KB) and Internal Flash (e.g., 512 KB)
+        work immediately with ZERO training needed!
+
+  [2. Hardware Vector Fetch (0x00000000 / 0x08000000 Internal Flash)]
+      - CPU hardware reads the first 2 words of Internal Flash:
+          Word 0: Initial Stack Pointer (sp = top of SRAM)
+          Word 1: Address of Reset_Handler() in Flash
+
+  [3. Reset_Handler() (Startup Assembly / C in Flash)]
+      - Copies initial values of global variables (.data) from Flash into SRAM.
+      - Zeroes out uninitialized global variables (.bss) in SRAM.
+      - Configures CPU clock PLL (e.g., 16 MHz crystal -> 180 MHz CPU clock).
+      - Calls main()! (Total boot time: < 2 milliseconds! No U-Boot, no DRAM!)
+
+
+===================================================================================
+TYPE 2: APPLICATION PROCESSOR (SoC) — e.g., RISC-V 64 / ARM64 (Qualcomm, TI, RPi)
+        (Runs Full Linux Kernel in Virtual Memory)
+===================================================================================
+  Why can't an Application Processor boot like an MCU?
+  Because a 2 GB external DDR4 DRAM chip is DEAD at power-on (needs clock/signal
+  training), and a 20 MB Linux kernel lives on an SD card / eMMC / Flash chip!
+
+  [Stage 0: On-Chip Mask ROM (Boot ROM — Etched into Silicon at Factory)]
+      - CPU powers on in highest privilege (M-mode on RISC-V / EL3 on ARM).
+      - DRAM is still dead! CPU uses tiny 64 KB on-chip SRAM.
+      - Mask ROM reads physical boot pins (SD card? SPI Flash? eMMC? USB?)
+        and copies a tiny 40 KB program called SPL from SD/Flash into on-chip SRAM.
+
+  [Stage 1: SPL (Secondary Program Loader / FSBL — Runs in On-Chip SRAM)]
+      - Initializes system clocks (PLLs) and trains the DDR DRAM controller!
+      - Now the external 128 MB / 2 GB DRAM chip (at 0x80000000) is ALIVE!
+      - SPL reads two files from SD card / Flash into DRAM:
+          1. Firmware (OpenSBI on RISC-V / TF-A on ARM) -> 0x80000000
+          2. U-Boot (Full Bootloader)                   -> 0x80200000
+      - SPL jumps to Firmware at 0x80000000.
+
+  [Stage 2: Machine Firmware (OpenSBI in M-Mode at 0x80000000)]
+      - Unlocks Physical Memory Protection (PMP) so S-mode can access DRAM.
+      - Delegates traps/interrupts (medeleg / mideleg) to S-mode.
+      - Unlocks hardware timer CSRs (mcounteren & menvcfg.STCE for 'stimecmp').
+      - Drops privilege from M-mode to S-mode ('mret') and jumps to U-Boot!
+
+  [Stage 3: U-Boot (Universal Bootloader — Runs in S-Mode in DRAM)]
+      - Has full drivers for Display, Ethernet (TFTP), USB, FAT32/ext4 filesystems.
+      - Reads 'vmlinux'/'Image' (Kernel) and 'board.dtb' (Device Tree) from SD card
+        or network into DRAM, sets a0 = hartid, a1 = dtb_addr, and jumps to Kernel!
+      *(Note: In fast-boot embedded systems or QEMU, U-Boot is skipped and Stage 2
+        jumps straight into the Kernel!)*
+
+  [Stage 4: OS Kernel ('my-linux' / Linux — Runs in S-Mode)]
+      - head.S masks interrupts, zeroes BSS, builds Sv39 page tables (setup_vm),
+        turns on MMU (satp), and relocates PC/SP to High-Half (0xFFFFFFC08xxxxxxx).
+      - start_kernel() initializes DTB, SLUB kmalloc, Timers (stimecmp), PLIC IRQs,
+        Scheduler, and launches '/bin/sh' in User Mode (U-mode)!
+```
+
+---
+
+## PART 2: The Clock Math Explained to a 12-Year-Old (`timebase-frequency` vs. `HZ`)
 
 ### 1. What Are the Two Numbers in Every OS Timer?
 
@@ -15,7 +126,7 @@ Imagine you have a wall clock in your classroom and a teacher who claps their ha
 
 ```text
 +-------------------------------------------------------------------------------+
-| 1. THE HARDWARE STOPWATCH (timebase-frequency):                               |
+| 1. THE HARDWARE STOPWATCH (riscv_timebase / timebase-frequency):              |
 |    - Inside the RISC-V chip, a hardware counter ('time' CSR) ticks upward     |
 |      automatically at a fixed crystal speed.                                  |
 |    - Remember when our FDT parser scanned '/cpus' in QEMU Virt?               |
@@ -34,134 +145,101 @@ Imagine you have a wall clock in your classroom and a teacher who claps their ha
 +-------------------------------------------------------------------------------+
 ```
 
-### 2. How Do We Calculate How Many Hardware Ticks Make 1 OS Heartbeat ("Jiffy")?
+### 2. How Many Hardware Ticks Make 1 OS Heartbeat ("Jiffy")?
 
-In Linux, one OS heartbeat interval (`1 / HZ` of a second) is called **1 Jiffy**.
-And a global counter called **`jiffies_64`** counts how many heartbeats have happened since the kernel booted!
-
-Now let's do the 12-year-old division math:
-- The hardware stopwatch ticks **`10,000,000` times per second** (`timebase-frequency = 10,000,000`).
-- Suppose we choose **`HZ = 100`** (we want the alarm to ring **100 times per second**, which is once every `10 ms`).
-- How many hardware stopwatch ticks happen in 1 Jiffy (`10 ms`)?
+In Linux, one OS heartbeat interval (`1 / HZ` of a second) is called **1 Jiffy**, and **`jiffies_64`** counts how many heartbeats have happened since boot:
 
 ```text
 THE JIFFY DELTA FORMULA:
 
-                       timebase_frequency       10,000,000 ticks/sec
-  Ticks per Jiffy  =  --------------------  =  ----------------------  =  100,000 ticks!
-                              HZ                  100 jiffies/sec
+                       riscv_timebase          10,000,000 ticks/sec
+  Ticks per Jiffy  =  ----------------     =  ----------------------  =  100,000 ticks!
+                             HZ                  100 jiffies/sec
 ```
-
-Look how simple that is!
 - Every time the hardware `time` counter goes up by **`100,000`**, **10 milliseconds (1 Jiffy)** have passed!
-- So if the current hardware `time` is `500,000`, when should the next alarm ring?
-  At `500,000 + 100,000 = 600,000`!
 
 ---
 
-## PART 2: Why Does Linux Split Timers into `clocksource` and `clock_event_device`?
+## PART 3: Modern Hardware `stimecmp` (`Sstc` CSR `0x14D`) vs. Old OpenSBI `ecall`
 
-In a beginner project, people write one giant `timer.c` file that mixes everything together.
-In the **upstream Linux kernel** (`include/linux/clocksource.h` and `include/linux/clockchips.h`), Linux separates time hardware into **two completely distinct roles**:
-
-```text
-+--------------------------------------+--------------------------------------+
-| 1. struct clocksource                | 2. struct clock_event_device         |
-|    ("The Wristwatch You Read")       |    ("The Kitchen Alarm That Rings")  |
-+--------------------------------------+--------------------------------------+
-| - Duty: Passively read a monotonically| - Duty: Program the hardware to fire |
-|   increasing counter whenever someone|   an interrupt at a future deadline! |
-|   asks "What time is it right now?"  |                                      |
-| - Does it ever fire an interrupt?    | - Does it fire an interrupt?         |
-|   NO!                                |   YES! (Supervisor Timer IRQ = 5)    |
-| - RISC-V Hardware Used:              | - RISC-V Hardware Used:              |
-|   'rdtime' instruction (reads 'time' |   OpenSBI sbi_set_timer(next_tick)   |
-|   CSR in 1 clock cycle!)             |   (or Sstc 'stimecmp' CSR)           |
-| - Upstream Linux File:               | - Upstream Linux File:               |
-|   drivers/clocksource/timer-riscv.c  |   drivers/clocksource/timer-riscv.c  |
-+--------------------------------------+--------------------------------------+
-```
-
-### How Does the Alarm Actually Ring on RISC-V? (OpenSBI `sbi_set_timer`)
-
-Remember from Milestone 1: in RISC-V, the raw Machine Timer comparator (`mtimecmp`) is an M-mode resource owned by OpenSBI firmware, while our kernel runs in S-mode.
-To set the next alarm deadline, our S-mode kernel makes an **SBI `ecall`** to OpenSBI (`EID = 0x54494D45` "TIME", `FID = 0`), passing the 64-bit `next_tick` deadline in register `a0`!
-*(Note: Why didn't our earlier `ecall` in `main.c` trap into `stvec`? Because S-mode `ecall` goes to OpenSBI! Now we use that exact S-mode `ecall` to tell OpenSBI when to fire our next timer interrupt!)*
+### 1. Why Modern RISC-V Added `stimecmp` (`CSR 0x14D`)
+- **The Old Way (2017–2021 RISC-V)**: Only Machine Mode had a timer comparator (`mtimecmp`). Every 10 ms, the S-mode kernel had to execute an `ecall` trap into M-mode (OpenSBI) just to set the next timer tick!
+- **The Modern Way (`Sstc` Extension — Upstream `linux/drivers/clocksource/timer-riscv.c` & `xv6-riscv/kernel/start.c`)**:
+  Modern RISC-V CPUs give Supervisor Mode its own 64-bit hardware comparator CSR: **`stimecmp` (CSR `0x14D`)**!
 
 ```text
-LIFE OF ONE TIMER INTERRUPT IN my-linux:
+HOW HARDWARE 'stimecmp' (CSR 0x14D) WORKS IN SILICON:
 
-  1. Kernel calls riscv_clock_next_event(rdtime() + 100000):
-     Executes SBI ecall (a7 = 0x54494D45, a0 = deadline).
-     OpenSBI programs hardware comparator and clears pending STIP bit.
-
-  2. Kernel enables Supervisor Timer Interrupts (sie.STIE = 1)
-     and Global Supervisor Interrupts (sstatus.SIE = 1).
-
-  3. 10 milliseconds pass (hardware 'time' reaches deadline)!
-
-  4. Hardware sets sip.STIP = 1 and traps CPU to 'stvec' (handle_exception)
-     with:
-       scause = (1UL << 63) | 5   (Bit 63 = Interrupt, Code 5 = Supervisor Timer!)
-
-  5. do_trap() sees Interrupt Code 5 -> calls timer_interrupt_handler():
-       a) Increments jiffies_64++
-       b) Rearms next alarm: riscv_clock_next_event(rdtime() + 100000)
-       c) Checks if any dynamic software timers (struct timer_list) expired!
+  +----------------------+          Hardware Comparator           +----------------------+
+  |  'time' CSR (0xC01)  | ------>  Is (time >= stimecmp)?  <---- | 'stimecmp' (0x14D)   |
+  |  (Ticks at 10 MHz)   |                   |                    | (Written by S-mode!) |
+  +----------------------+                   |                    +----------------------+
+                                             +-- If YES: Sets sip.STIP = 1
+                                                         (Fires S-Mode Timer IRQ 5!)
+                                             +-- If NO:  Clears sip.STIP = 0 automatically!
 ```
+
+Look at the two huge benefits of `stimecmp`:
+1. **1 Single Instruction in S-Mode**: Writing `csrw 0x14d, next_tval` arms the next timer interrupt in 1 CPU cycle—**zero `ecall` to Machine Mode!**
+2. **Automatic Interrupt Clearing**: The instant S-mode writes a future value (`rdtime() + 100000`) or `U64_MAX` (`~0ULL`) into `stimecmp`, the hardware sees `time < stimecmp` and **automatically clears the pending timer interrupt (`sip.STIP = 0`)**!
+
+### 2. What Unlocks `stimecmp` in Machine Mode (When Booting Bare-Metal `-bios none`)?
+When the CPU powers on in Machine Mode at `0x80000000`, `stimecmp` is locked by default until M-mode sets two CSR bits (just like `xv6-riscv/kernel/start.c` and OpenSBI do):
+1. **`mcounteren |= 0x2`**: Allows S-mode to read the `time` counter (`rdtime`).
+2. **`menvcfg |= (1ULL << 63)` (`ENVCFG_STCE`)**: Enables **S**upervisor **T**imer **C**ounter **E**xtension (`stimecmp` CSR `0x14D`)!
 
 ---
 
-## PART 3: Dynamic Kernel Timers (`struct timer_list`) — The Linux Way!
+## PART 4: Interrupt Top-Half vs. Bottom-Half (`kernel/softirq.c`) — The Linux Way!
 
-### 1. What Is `struct timer_list` and Why Do Drivers Need It?
+### 1. Why Does Linux Split Every Interrupt into a "Top Half" and a "Bottom Half"?
 
-Suppose you are writing an LED driver, a network timeout, or an SPI sensor polling driver.
-You want to say: *"Run my function `my_timeout_callback()` 500 milliseconds (50 jiffies) from now, without freezing the CPU in a `while` loop!"*
-
-In Linux (`include/linux/timer.h`), you use **`struct timer_list`**!
-Look how our **intrusive linked list (`struct list_head`)** from Milestone 4 comes back to shine:
-
-```c
-/* Target File Concept: include/linux/timer.h */
-struct timer_list {
-    struct list_head entry;             /* Links into the kernel's active timer list! */
-    unsigned long expires;              /* The jiffies_64 value when this timer should fire */
-    void (*function)(struct timer_list *t); /* Callback function to run when expired */
-};
-```
+Imagine an emergency room doctor when an ambulance arrives:
+1. **The Top Half (Hard IRQ Context — Emergency Triage)**:
+   - When a hardware interrupt fires and the CPU jumps to `stvec` (`handle_exception` $\rightarrow$ `do_trap`), the CPU automatically **disables all interrupts (`sstatus.SIE = 0`)**!
+   - While inside this Hard IRQ handler, **no other interrupt can be serviced**.
+   - So the **Top Half** must do only the bare minimum hardware work (update `jiffies_64++`, write the next deadline to `stimecmp`, and raise a flag `raise_softirq(TIMER_SOFTIRQ)`), finishing in a few nanoseconds!
+2. **The Bottom Half (Softirq Context — Deferred Processing)**:
+   - What about walking the list of 50 software timers (`struct timer_list`) and running their callback functions (`run_timer_softirq()`)?
+   - That is deferred to the **Bottom Half (`kernel/softirq.c`)**, which runs inside **`irq_exit()`** right as the interrupt handler finishes!
 
 ```text
-ACTIVE KERNEL TIMERS LINKED ON timer_list_head:
+UPSTREAM LINUX INTERRUPT FLOW (TOP HALF -> irq_exit() -> BOTTOM HALF):
 
-  [timer_list_head] <---> [Timer A: expires = 50] <---> [Timer B: expires = 200] <---> [timer_list_head]
+  [Hardware Timer Interrupt Fires (time >= stimecmp, scause = 5)]
+                   |
+                   v
+  +---------------------------------------------------------------------------+
+  | 1. TOP HALF (Hard IRQ Context in drivers/clocksource/timer-riscv.c):      |
+  |    riscv_timer_interrupt() -> tick_handle_periodic():                     |
+  |      a) jiffies_64++                                                      |
+  |      b) Rearm stimecmp:  csrw 0x14d, get_cycles64() + (riscv_timebase/HZ) |
+  |      c) Schedule Bottom Half:  raise_softirq(TIMER_SOFTIRQ);              |
+  +---------------------------------------------------------------------------+
+                   |
+                   v
+  +---------------------------------------------------------------------------+
+  | 2. BOTTOM HALF (Softirq Context in kernel/softirq.c):                     |
+  |    At the end of do_trap(), irq_exit() checks 'softirq_pending':          |
+  |      - Sees Bit 1 (TIMER_SOFTIRQ) is set!                                 |
+  |      - Calls __do_softirq() -> softirq_vec[TIMER_SOFTIRQ].action()        |
+  |      - Executes run_timer_softirq() to fire expired struct timer_list!    |
+  +---------------------------------------------------------------------------+
 ```
 
-Every time `jiffies_64` ticks upward in the timer interrupt (or in `TIMER_SOFTIRQ`), the kernel walks `timer_list_head`:
-- If `jiffies_64 >= timer->expires`:
-  1. Unlink `timer->entry` from the list (`list_del`).
-  2. Call `timer->function(timer)`!
-- And if the driver wants a repeating timer, inside `timer->function(timer)` it simply calls `mod_timer(timer, jiffies_64 + 50)` to schedule itself again!
-
----
-
-## PART 4: How Upstream `linux/arch/riscv/kernel/time.c` & `drivers/clocksource/timer-riscv.c` Work
-
-Let's inspect the actual upstream Linux files in `C:\workspace\career_ws\linux`:
-1. **`linux/arch/riscv/kernel/head.S` (line 245)**:
-   Enables the `time` counter CSR via `scounteren`:
-   ```assembly
-   li t0, 0x2
-   csrw scounteren, t0
+### 2. How `kernel/softirq.c` Works in Upstream Linux (`include/linux/interrupt.h`)
+In upstream Linux (`include/linux/interrupt.h` and `kernel/softirq.c`):
+1. There is a small table of 10 statically-defined Softirq types (`HI_SOFTIRQ = 0`, **`TIMER_SOFTIRQ = 1`**, `NET_TX_SOFTIRQ = 2`, `NET_RX_SOFTIRQ = 3`, ...):
+   ```c
+   struct softirq_action {
+       void (*action)(struct softirq_action *);
+   };
+   static struct softirq_action softirq_vec[NR_SOFTIRQS];
    ```
-2. **`linux/arch/riscv/kernel/time.c` (lines 18–45)**:
-   Defines `unsigned long riscv_timebase;` and reads the `"timebase-frequency"` property dynamically from the `/cpus` node in the Device Tree! (No hardcoded `#define RISCV_TIMEBASE_FREQ 10000000`!).
-   Then calculates ticks per jiffy (`lpj_fine = riscv_timebase / HZ;`).
-3. **`linux/drivers/clocksource/timer-riscv.c` (lines 28–152)**:
-   - **`riscv_clock_event_stop()`**: Calls `sbi_set_timer(U64_MAX)` (`~0ULL`) to clear/stop any pending timer interrupt before programming or handling an event.
-   - **`riscv_clock_next_event(unsigned long delta, struct clock_event_device *ce)`**: Reads `rdtime() + delta` and calls `sbi_set_timer(next_tval)`.
-   - **`riscv_clocksource_rdtime(struct clocksource *cs)`**: Returns `rdtime()`.
-   - **`riscv_timer_interrupt()`**: Stops the current event (`riscv_clock_event_stop()`), then invokes `evdev->event_handler(evdev)` (which increments `jiffies_64`, rearms the next tick `riscv_timebase / HZ`, and runs expired `struct timer_list` callbacks!).
+2. A 32-bit bitmap (`uint32_t softirq_pending`) tracks which softirqs have work waiting:
+   - **`open_softirq(nr, action)`**: Registers the callback function in `softirq_vec[nr].action`.
+   - **`raise_softirq(nr)`**: Sets bit `nr` in `softirq_pending |= (1U << nr);` (Called by the Top Half!).
+   - **`irq_exit()` $\rightarrow$ `__do_softirq()`**: Loops over any set bits in `softirq_pending`, clears the bit, and calls `softirq_vec[nr].action()`! (And uses an `in_softirq` guard flag so nested interrupts don't re-enter `__do_softirq()`).
 
 ---
 
@@ -171,28 +249,91 @@ Here are the exact files for you to update or create in `my-linux/`.
 
 ---
 
-### Step 1: Enable `scounteren` in `my-linux/arch/riscv/kernel/head.S`
+### Step 1: Dual-Boot Bare-Metal (`0x80000000`) & OpenSBI (`0x80200000`) in `vmlinux.lds.S` and `head.S`
 
-**What this change does:**
-Matching `linux/arch/riscv/kernel/head.S` (line 245), setting Bit 1 (`0x2`) in `scounteren` permits reading the hardware `time` CSR (`rdtime`).
+#### A. In `my-linux/arch/riscv/kernel/vmlinux.lds.S`:
+Replace `. = 0x80200000;` with `#ifdef CONFIG_RISCV_M_MODE`:
+```ld
+/* Target File: my-linux/arch/riscv/kernel/vmlinux.lds.S */
+#ifdef CONFIG_RISCV_M_MODE
+    . = 0x80000000;
+#else
+    . = 0x80200000;
+#endif
+```
 
-Add these two lines right after `csrw sip, zero` in **`my-linux/arch/riscv/kernel/head.S`**:
+#### B. In `my-linux/arch/riscv/kernel/head.S`:
+At the top of `_start`, add the `#ifdef CONFIG_RISCV_M_MODE` bare-metal Machine-Mode setup block (matching `linux/arch/riscv/kernel/head.S` and `xv6-riscv/kernel/start.c`) that unlocks PMP, delegates traps, unlocks `time` (`mcounteren |= 2`) and **`stimecmp` (`menvcfg |= (1 << 63)`)**, and executes `mret` into `.Ls_mode_entry`:
+
 ```assembly
 /* Target File: my-linux/arch/riscv/kernel/head.S */
-    /* Enable time CSR access (matching upstream linux/arch/riscv/kernel/head.S) */
+/* SPDX-License-Identifier: GPL-2.0-only */
+
+.section .text.init
+.global _start
+
+_start:
+#ifdef CONFIG_RISCV_M_MODE
+    /*
+     * BARE-METAL MACHINE MODE ENTRY (-bios none at 0x80000000):
+     * Perform the exact hardware initialization that OpenSBI does!
+     */
+    /* 1. Read hardware thread ID into a0 (a1 already holds DTB from 0x1000 ROM) */
+    csrr a0, mhartid
+    bnez a0, .Lsecondary_park
+
+    /* 2. Configure Physical Memory Protection (PMP) to allow S-mode full access */
+    li   t0, 0x3fffffffffffff
+    csrw pmpaddr0, t0
+    li   t0, 0xf
+    csrw pmpcfg0, t0
+
+    /* 3. Delegate all exceptions and interrupts to Supervisor Mode (S-mode) */
+    li   t0, 0xffff
+    csrw medeleg, t0
+    csrw mideleg, t0
+
+    /* 4. Unlock 'time' CSR (mcounteren bit 1) and 'stimecmp' (menvcfg bit 63 STCE)! */
+    csrr t0, mcounteren
+    ori  t0, t0, 2
+    csrw mcounteren, t0
+
+    li   t0, (1 << 63)          /* ENVCFG_STCE: Unlock S-mode stimecmp (0x14D)! */
+    csrs menvcfg, t0
+
+    /* 5. Set mstatus.MPP = S-Mode (1 << 11) and mepc = .Ls_mode_entry, then mret! */
+    csrr t0, mstatus
+    li   t1, ~(3 << 11)
+    and  t0, t0, t1
+    li   t1, (1 << 11)          /* MPP = 01 (Supervisor Mode) */
+    or   t0, t0, t1
+    csrw mstatus, t0
+
+    la   t0, .Ls_mode_entry
+    csrw mepc, t0
+    mret
+#endif
+
+.Ls_mode_entry:
+    /* 1. Mask all supervisor interrupts and clear pending flags */
+    csrw sie, zero
+    csrw sip, zero
+
+    /* 2. Enable time CSR (rdtime) access */
     li   t0, 0x2
     csrw scounteren, t0
+
+    /* 3. Park secondary cores (only Hart 0 runs the boot sequence) */
+    bnez a0, .Lsecondary_park
 ```
+*(Keep the rest of `head.S` from `/* 4. Load initial boot stack pointer */` downward identical!)*
 
 ---
 
 ### Step 2: Dynamically Read `"timebase-frequency"` in `my-linux/arch/riscv/kernel/setup.c`
 
-**What this change does:**
-In `my-linux/arch/riscv/kernel/setup.c`, your `fdt_scan_nodes()` loop already visits every `FDT_PROP` token and gets `const char *prop_name` and the value pointer `p`!
-When `prop_name` matches `"timebase-frequency"`, we read the 32-bit Big-Endian integer `be32_to_cpu(*p)` and store it in **`unsigned long riscv_timebase`** (matching upstream `linux/arch/riscv/kernel/time.c`)!
+In **`my-linux/arch/riscv/kernel/setup.c`**, extract `"timebase-frequency"` (`10000000`) from the Device Tree into `unsigned long riscv_timebase` (matching upstream `linux/arch/riscv/kernel/time.c`):
 
-Add a simple string comparison helper `fdt_streq` and capture `riscv_timebase` in **`my-linux/arch/riscv/kernel/setup.c`**:
 ```c
 /* Target File: my-linux/arch/riscv/kernel/setup.c */
 
@@ -233,13 +374,20 @@ static int fdt_streq(const char *a, const char *b)
 
 ---
 
-### Step 3: Create `my-linux/arch/riscv/include/asm/csr.h` (Interrupt & Counter Helpers)
+### Step 3: Create `my-linux/arch/riscv/include/asm/csr.h` (With Hardware `CSR_STIMECMP = 0x14D`!)
+
+**What this file does:**
+Defines the interrupt bits and the modern `stimecmp` CSR (`0x14D`, matching `linux/arch/riscv/include/asm/csr.h`).
+Why do we write `"csrw 0x14d, %0"` using the numeric CSR address `0x14d`?
+Because numeric CSR addresses (`0x14d`) assemble cleanly on every RISC-V binutils version without needing special `-march=rv64gc_sstc` compiler flags!
 
 ```c
 /* Target File: my-linux/arch/riscv/include/asm/csr.h */
 /* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef _ASM_RISCV_CSR_H
 #define _ASM_RISCV_CSR_H
+
+#include <linux/types.h>
 
 /* sstatus CSR bits */
 #define SR_SIE              (1UL << 1)  /* Supervisor Interrupt Enable */
@@ -257,11 +405,20 @@ static int fdt_streq(const char *a, const char *b)
 #define RV_IRQ_TIMER        5
 #define RV_IRQ_EXT          9
 
+/* Sstc Extension: Supervisor Timer Compare CSR (0x14D) */
+#define CSR_STIMECMP        0x14d
+
 static inline unsigned long get_cycles64(void)
 {
     unsigned long val;
     __asm__ volatile("rdtime %0" : "=r"(val));
     return val;
+}
+
+/* Write deadline directly to hardware stimecmp CSR (0x14D) in S-mode! */
+static inline void csr_write_stimecmp(uint64_t val)
+{
+    __asm__ volatile("csrw 0x14d, %0" : : "r"(val) : "memory");
 }
 
 static inline void local_irq_enable(void)
@@ -279,8 +436,117 @@ static inline void local_irq_disable(void)
 
 ---
 
-### Step 4: Create `my-linux/include/linux/timer.h` (Upstream Linux Timer & Clock Structures)
+### Step 4: Create `my-linux/include/linux/interrupt.h` & `my-linux/kernel/softirq.c` (Bottom-Half Engine!)
 
+#### A. Create `my-linux/include/linux/interrupt.h`:
+```c
+/* Target File: my-linux/include/linux/interrupt.h */
+/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef _LINUX_INTERRUPT_H
+#define _LINUX_INTERRUPT_H
+
+#include <linux/types.h>
+
+/* Upstream Linux Softirq Indices (include/linux/interrupt.h) */
+enum {
+    HI_SOFTIRQ = 0,
+    TIMER_SOFTIRQ,
+    NET_TX_SOFTIRQ,
+    NET_RX_SOFTIRQ,
+    NR_SOFTIRQS
+};
+
+struct softirq_action {
+    void (*action)(struct softirq_action *);
+};
+
+void softirq_init(void);
+void open_softirq(int nr, void (*action)(struct softirq_action *));
+void raise_softirq(unsigned int nr);
+void irq_enter(void);
+void irq_exit(void);
+
+#endif /* _LINUX_INTERRUPT_H */
+```
+
+#### B. Create `my-linux/kernel/softirq.c`:
+```c
+/* Target File: my-linux/kernel/softirq.c */
+/* SPDX-License-Identifier: GPL-2.0-only */
+#include <linux/types.h>
+#include <linux/interrupt.h>
+
+void early_puts(const char *s);
+
+static struct softirq_action softirq_vec[NR_SOFTIRQS];
+static volatile uint32_t softirq_pending = 0;
+static volatile int irq_nest_count = 0;
+static volatile int in_softirq = 0;
+
+void open_softirq(int nr, void (*action)(struct softirq_action *))
+{
+    if (nr >= 0 && nr < NR_SOFTIRQS) {
+        softirq_vec[nr].action = action;
+    }
+}
+
+void raise_softirq(unsigned int nr)
+{
+    if (nr < NR_SOFTIRQS) {
+        softirq_pending |= (1U << nr);
+    }
+}
+
+static void __do_softirq(void)
+{
+    in_softirq = 1;
+
+    uint32_t pending = softirq_pending;
+    softirq_pending = 0;
+
+    for (int i = 0; i < NR_SOFTIRQS; i++) {
+        if (pending & (1U << i)) {
+            if (softirq_vec[i].action) {
+                softirq_vec[i].action(&softirq_vec[i]);
+            }
+        }
+    }
+
+    in_softirq = 0;
+}
+
+void irq_enter(void)
+{
+    irq_nest_count++;
+}
+
+void irq_exit(void)
+{
+    if (irq_nest_count > 0) {
+        irq_nest_count--;
+    }
+
+    /* Run pending Bottom-Half softirqs when returning from the outer Hard IRQ! */
+    if (irq_nest_count == 0 && !in_softirq && softirq_pending != 0) {
+        __do_softirq();
+    }
+}
+
+void softirq_init(void)
+{
+    for (int i = 0; i < NR_SOFTIRQS; i++) {
+        softirq_vec[i].action = NULL;
+    }
+    softirq_pending = 0;
+    early_puts("[SOFTIRQ] Bottom-Half softirq subsystem initialized.\n");
+}
+```
+
+---
+
+### Step 5: Create `my-linux/include/linux/timer.h` & `my-linux/drivers/clocksource/timer-riscv.c`
+
+#### A. Create `my-linux/include/linux/timer.h`:
 ```c
 /* Target File: my-linux/include/linux/timer.h */
 /* SPDX-License-Identifier: GPL-2.0 */
@@ -298,18 +564,12 @@ static inline void local_irq_disable(void)
 extern unsigned long riscv_timebase;
 extern volatile uint64_t jiffies_64;
 
-/*
- * struct clocksource - Upstream Linux monotonic counter abstraction
- */
 struct clocksource {
     const char *name;
     int rating;
     uint64_t (*read)(struct clocksource *cs);
 };
 
-/*
- * struct clock_event_device - Upstream Linux timer event generator abstraction
- */
 struct clock_event_device {
     const char *name;
     int rating;
@@ -318,9 +578,6 @@ struct clock_event_device {
     void (*event_handler)(struct clock_event_device *ce);
 };
 
-/*
- * struct timer_list - Dynamic kernel software timer
- */
 struct timer_list {
     struct list_head entry;
     uint64_t expires;
@@ -330,7 +587,6 @@ struct timer_list {
 void timer_setup(struct timer_list *timer, void (*callback)(struct timer_list *), unsigned int flags);
 int mod_timer(struct timer_list *timer, uint64_t expires);
 int del_timer(struct timer_list *timer);
-void run_timer_softirq(void);
 
 void time_init(void);
 void riscv_timer_interrupt(void);
@@ -338,21 +594,18 @@ void riscv_timer_interrupt(void);
 #endif /* _LINUX_TIMER_H */
 ```
 
----
-
-### Step 5: Create `my-linux/drivers/clocksource/timer-riscv.c` (Matching Upstream `timer-riscv.c`)
-
-**Before writing the code, trace how upstream `drivers/clocksource/timer-riscv.c` works:**
-1. **`riscv_clock_event_stop()`**: Calls `sbi_set_timer(U64_MAX)` (`0xFFFFFFFFFFFFFFFF`) so the hardware comparator is set to infinity and `sip.STIP` is cleared until the next deadline is programmed.
-2. **`riscv_clock_next_event(delta, ce)`**: Reads `next_tval = get_cycles64() + delta` and calls `sbi_set_timer(next_tval)`.
-3. **`riscv_timer_interrupt()`**: Called from `do_trap()` when `scause` is `RV_IRQ_TIMER` (`5`). Just like upstream `timer-riscv.c` (line 145), it calls `riscv_clock_event_stop()` and then invokes `riscv_clock_event.event_handler(&riscv_clock_event)`!
-4. **`tick_handle_periodic(ce)` (our `event_handler`)**: Increments `jiffies_64++`, rearms the next tick (`riscv_timebase / HZ`), and runs any expired `struct timer_list` callbacks!
+#### B. Create `my-linux/drivers/clocksource/timer-riscv.c`:
+Look at how clean `riscv_clock_event_stop()` and `riscv_clock_next_event()` are now:
+- They write directly to **`csr_write_stimecmp()` (`CSR 0x14D`)**!
+- **Top Half (`tick_handle_periodic`)**: Increments `jiffies_64++`, rearms `stimecmp`, and calls **`raise_softirq(TIMER_SOFTIRQ)`**!
+- **Bottom Half (`run_timer_softirq`)**: Registered via `open_softirq(TIMER_SOFTIRQ, run_timer_softirq);` and executed automatically by `irq_exit()`!
 
 ```c
 /* Target File: my-linux/drivers/clocksource/timer-riscv.c */
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <linux/types.h>
 #include <linux/list.h>
+#include <linux/interrupt.h>
 #include <linux/timer.h>
 #include <asm/csr.h>
 
@@ -365,38 +618,23 @@ volatile uint64_t jiffies_64 = 0;
 static LIST_HEAD(active_timers);
 
 /*
- * sbi_set_timer - Ask OpenSBI firmware to program the next timer interrupt deadline
- */
-static void sbi_set_timer(uint64_t stime_value)
-{
-    register unsigned long a0 __asm__("a0") = (unsigned long)stime_value;
-    register unsigned long a6 __asm__("a6") = 0;            /* FID = 0 */
-    register unsigned long a7 __asm__("a7") = 0x54494D45UL; /* EID = "TIME" */
-
-    __asm__ volatile("ecall"
-                     : "+r"(a0)
-                     : "r"(a6), "r"(a7)
-                     : "memory");
-}
-
-/*
- * riscv_clock_event_stop - Clear pending timer interrupt by setting comparator to U64_MAX
+ * riscv_clock_event_stop - Stop timer comparator by writing U64_MAX to stimecmp
  * (Matches upstream linux/drivers/clocksource/timer-riscv.c::riscv_clock_event_stop)
  */
 static void riscv_clock_event_stop(void)
 {
-    sbi_set_timer(U64_MAX);
+    csr_write_stimecmp(U64_MAX);
 }
 
 /*
- * riscv_clock_next_event - Program next timer interrupt 'delta' counter ticks from now
+ * riscv_clock_next_event - Program next timer deadline directly into stimecmp (CSR 0x14D)
  * (Matches upstream linux/drivers/clocksource/timer-riscv.c::riscv_clock_next_event)
  */
 static int riscv_clock_next_event(unsigned long delta, struct clock_event_device *ce)
 {
     (void)ce;
     uint64_t next_tval = get_cycles64() + delta;
-    sbi_set_timer(next_tval);
+    csr_write_stimecmp(next_tval);
     return 0;
 }
 
@@ -407,10 +645,6 @@ static int riscv_clock_shutdown(struct clock_event_device *evt)
     return 0;
 }
 
-/*
- * riscv_clocksource_rdtime - Read monotonic hardware counter ('time' CSR)
- * (Matches upstream linux/drivers/clocksource/timer-riscv.c::riscv_clocksource_rdtime)
- */
 static uint64_t riscv_clocksource_rdtime(struct clocksource *cs)
 {
     (void)cs;
@@ -424,32 +658,32 @@ struct clocksource riscv_clocksource = {
 };
 
 /*
- * tick_handle_periodic - Generic tick handler registered as ce->event_handler
+ * TOP HALF: tick_handle_periodic - Runs in Hard IRQ context!
+ * Does ONLY fast hardware rearming + jiffies_64++, then raises TIMER_SOFTIRQ!
  */
 static void tick_handle_periodic(struct clock_event_device *ce)
 {
     /* 1. Advance the OS heartbeat counter */
     jiffies_64++;
 
-    /* 2. Rearm hardware comparator for the next jiffy (riscv_timebase / HZ)! */
+    /* 2. Rearm hardware stimecmp for the next jiffy (riscv_timebase / HZ)! */
     unsigned long ticks_per_jiffy = riscv_timebase / HZ;
     ce->set_next_event(ticks_per_jiffy, ce);
 
-    /* 3. Run expired dynamic software timers (struct timer_list) */
-    run_timer_softirq();
+    /* 3. Defer software timer_list processing to the Bottom Half (TIMER_SOFTIRQ)! */
+    raise_softirq(TIMER_SOFTIRQ);
 }
 
 struct clock_event_device riscv_clock_event = {
     .name               = "riscv_timer_clockevent",
-    .rating             = 100,
+    .rating             = 450,
     .set_next_event     = riscv_clock_next_event,
     .set_state_shutdown = riscv_clock_shutdown,
     .event_handler      = tick_handle_periodic,
 };
 
 /*
- * riscv_timer_interrupt - Low-level timer interrupt handler called from do_trap()
- * (Matches upstream linux/drivers/clocksource/timer-riscv.c::riscv_timer_interrupt)
+ * TOP HALF Entry: riscv_timer_interrupt - Called from do_trap() on RV_IRQ_TIMER (scause = 5)
  */
 void riscv_timer_interrupt(void)
 {
@@ -461,9 +695,6 @@ void riscv_timer_interrupt(void)
     }
 }
 
-/*
- * timer_setup - Initialize a dynamic kernel timer_list struct
- */
 void timer_setup(struct timer_list *timer, void (*callback)(struct timer_list *), unsigned int flags)
 {
     (void)flags;
@@ -472,9 +703,6 @@ void timer_setup(struct timer_list *timer, void (*callback)(struct timer_list *)
     timer->function = callback;
 }
 
-/*
- * mod_timer - Activate or update a timer's expiration jiffy
- */
 int mod_timer(struct timer_list *timer, uint64_t expires)
 {
     timer->expires = expires;
@@ -484,9 +712,6 @@ int mod_timer(struct timer_list *timer, uint64_t expires)
     return 0;
 }
 
-/*
- * del_timer - Remove a timer before it expires
- */
 int del_timer(struct timer_list *timer)
 {
     if (!list_empty(&timer->entry)) {
@@ -498,10 +723,12 @@ int del_timer(struct timer_list *timer)
 }
 
 /*
- * run_timer_softirq - Check active_timers and fire any expired callbacks
+ * BOTTOM HALF: run_timer_softirq - Registered on TIMER_SOFTIRQ!
+ * Executed by irq_exit() -> __do_softirq() after the Top Half finishes!
  */
-void run_timer_softirq(void)
+static void run_timer_softirq(struct softirq_action *h)
 {
+    (void)h;
     struct list_head *curr = active_timers.next;
     while (curr != &active_timers) {
         struct timer_list *t = list_entry(curr, struct timer_list, entry);
@@ -518,10 +745,6 @@ void run_timer_softirq(void)
     }
 }
 
-/*
- * time_init - Verify DTB timebase, arm first tick, and enable Supervisor Timer Interrupts
- * (Matches upstream linux/arch/riscv/kernel/time.c::time_init & riscv_timer_starting_cpu)
- */
 void time_init(void)
 {
     if (riscv_timebase == 0) {
@@ -529,12 +752,15 @@ void time_init(void)
         return;
     }
 
+    /* Register TIMER_SOFTIRQ Bottom-Half handler */
+    open_softirq(TIMER_SOFTIRQ, run_timer_softirq);
+
     unsigned long ticks_per_jiffy = riscv_timebase / HZ;
-    early_puts("[TIME] Initializing RISC-V clocksource & clockevent (ticks_per_jiffy = ");
+    early_puts("[TIME] Initializing Sstc stimecmp clockevent (ticks_per_jiffy = ");
     early_print_dec(ticks_per_jiffy);
     early_puts(")...\n");
 
-    /* Clear any pending timer interrupt and arm the first tick */
+    /* Clear any pending timer interrupt and arm the first tick via stimecmp */
     riscv_clock_event_stop();
     riscv_clock_event.set_next_event(ticks_per_jiffy, &riscv_clock_event);
 
@@ -545,37 +771,100 @@ void time_init(void)
     /* Enable Master Supervisor Interrupts (SR_SIE) in sstatus CSR */
     local_irq_enable();
 
-    early_puts("[TIME] Supervisor Timer Interrupts Enabled!\n");
+    early_puts("[TIME] Sstc stimecmp Timer Interrupts Enabled!\n");
 }
 ```
 
 ---
 
-### Step 6: Update `my-linux/arch/riscv/kernel/traps.c` to Call `riscv_timer_interrupt()`
+### Step 6: Update `my-linux/arch/riscv/kernel/traps.c` with `irq_enter()` and `irq_exit()`!
 
-Inside `do_trap()` in **`my-linux/arch/riscv/kernel/traps.c`**, when `is_interrupt` is true and `code == RV_IRQ_TIMER` (`5`), call `riscv_timer_interrupt()`:
-
+Look at how `do_trap()` in **`my-linux/arch/riscv/kernel/traps.c`** now connects the **Top Half** and **Bottom Half**:
 ```c
 /* Target File: my-linux/arch/riscv/kernel/traps.c */
+#include <linux/interrupt.h>
 #include <linux/timer.h>
 #include <asm/csr.h>
 
 /* Inside do_trap(struct pt_regs *regs): */
     if (is_interrupt) {
+        irq_enter(); /* Enter Hard IRQ Top-Half context */
+
         if (code == RV_IRQ_TIMER) {
-            /* Supervisor Timer Interrupt (scause = 5) */
-            riscv_timer_interrupt();
+            riscv_timer_interrupt(); /* Top Half: jiffies_64++, stimecmp, raise_softirq */
         } else {
             early_puts("[TRAP] Supervisor Interrupt received!\n");
         }
+
+        irq_exit();  /* Exit Hard IRQ -> automatically runs pending Softirq Bottom Halves! */
     }
 ```
 
 ---
 
+### Step 7: Add `Makefile` Rules (Including `make qemu-baremetal`), `main.c`, and KUnit Timer Test!
+
+1. **In `my-linux/Makefile`**:
+   - Add `kernel/softirq.c` and `drivers/clocksource/timer-riscv.c` to `SRCS_C`:
+     ```makefile
+     SRCS_C  += kernel/softirq.c
+     SRCS_C  += drivers/clocksource/timer-riscv.c
+     ```
+   - Add the `qemu-baremetal` target so you can test **both** `-bios default` (`make qemu`) and bare-metal M-mode `-bios none` (`make qemu-baremetal`):
+     ```makefile
+     qemu-baremetal:
+     	$(MAKE) clean
+     	$(MAKE) CFLAGS="$(CFLAGS) -DCONFIG_RISCV_M_MODE"
+     	qemu-system-riscv64 -machine virt -cpu rv64 -m 128M -bios none -kernel vmlinux -nographic -smp 1
+     ```
+2. **In `my-linux/init/main.c`**:
+   - Include `<linux/interrupt.h>` and `<linux/timer.h>`, and call `softirq_init();` and `time_init();` before `kunit_run_all_tests();`.
+3. **In `my-linux/lib/kunit/test_kernel.c`**:
+   - Add `kunit_test_timer()` to schedule a dynamic `struct timer_list` callback 5 jiffies (`50 ms`) in the future, wait for the Bottom-Half `TIMER_SOFTIRQ` callback to fire, and print `[PASS]`!
+
+```c
+/* Target File: my-linux/lib/kunit/test_kernel.c */
+#include <linux/timer.h>
+
+static volatile int timer_callback_fired = 0;
+
+static void test_timer_callback(struct timer_list *t)
+{
+    (void)t;
+    timer_callback_fired = 1;
+    early_puts("  [TIMER_SOFTIRQ] Bottom-Half timer_list callback fired at jiffies = ");
+    early_print_dec((unsigned long)jiffies_64);
+    early_puts("!\n");
+}
+
+static void kunit_test_timer(void)
+{
+    early_puts("[KUNIT] 5. Testing Sstc stimecmp Top-Half & TIMER_SOFTIRQ Bottom-Half...\n");
+
+    struct timer_list my_timer;
+    uint64_t start_jiffies = jiffies_64;
+    timer_callback_fired = 0;
+
+    timer_setup(&my_timer, test_timer_callback, 0);
+    mod_timer(&my_timer, start_jiffies + 5); /* Fire 5 jiffies (50 ms) from now */
+
+    while (!timer_callback_fired) {
+        __asm__ volatile("wfi");
+    }
+
+    if (jiffies_64 >= start_jiffies + 5) {
+        early_puts("  [PASS] Hardware stimecmp IRQ + TIMER_SOFTIRQ Bottom-Half verified!\n\n");
+    }
+}
+```
+*(Note: When testing `ecall` in `kunit_test_traps()` under bare-metal `-bios none`, remember that in `head.S` we delegated `medeleg = 0xffff` including Bit 9! So under `-bios none`, S-mode `ecall` traps directly into our own `do_trap()` `code == 9` handler too!)*
+
+---
+
 ## PART 6: Plain-Language Feynman Recap
 
-1. **`riscv_timebase` (10 MHz)** is discovered dynamically from the Device Tree `/cpus` `"timebase-frequency"` property (matching `linux/arch/riscv/kernel/time.c`), never hardcoded!
-2. **`HZ` (100)** is our chosen OS heartbeat rate (`100` interrupts/sec = `10 ms` per jiffy).
-3. **`ticks_per_jiffy = riscv_timebase / HZ` (`100,000`)** is how far ahead `riscv_clock_next_event()` sets the alarm on each tick.
-4. **`riscv_clocksource`** reads `get_cycles64()` (`rdtime`); **`riscv_clock_event`** stops/arms the hardware comparator via `sbi_set_timer()` and invokes `event_handler` (`tick_handle_periodic`); **`struct timer_list`** lets any driver schedule callbacks in the future using `jiffies_64`!
+1. **Dual-Boot (`make qemu` & `make qemu-baremetal`)**: With `-DCONFIG_RISCV_M_MODE`, `vmlinux` links at `0x80000000`, runs our own M-mode setup in `head.S` (unlocking PMP, delegating traps, and setting `menvcfg.STCE = 1` to unlock `stimecmp`), and drops to S-mode via `mret`.
+2. **Hardware `stimecmp` (`CSR 0x14D`)**: S-mode programs the next timer deadline in 1 instruction (`csrw 0x14d, next_tval`) with zero runtime M-mode `ecall`.
+3. **Top Half vs. Bottom Half**:
+   - **Top Half (`riscv_timer_interrupt`)**: Runs in Hard IRQ context (`irq_enter`), increments `jiffies_64++`, rearms `stimecmp`, and calls `raise_softirq(TIMER_SOFTIRQ)`.
+   - **Bottom Half (`kernel/softirq.c`)**: Runs in `irq_exit()` $\rightarrow$ `__do_softirq()`, invoking `run_timer_softirq()` to execute expired `struct timer_list` callbacks!
