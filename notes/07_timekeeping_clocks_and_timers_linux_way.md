@@ -868,3 +868,393 @@ static void kunit_test_timer(void)
 3. **Top Half vs. Bottom Half**:
    - **Top Half (`riscv_timer_interrupt`)**: Runs in Hard IRQ context (`irq_enter`), increments `jiffies_64++`, rearms `stimecmp`, and calls `raise_softirq(TIMER_SOFTIRQ)`.
    - **Bottom Half (`kernel/softirq.c`)**: Runs in `irq_exit()` $\rightarrow$ `__do_softirq()`, invoking `run_timer_softirq()` to execute expired `struct timer_list` callbacks!
+
+
+### Complete Walkthrough of `my-linux/drivers/clocksource/timer-riscv.c`
+
+To understand and remember every single function in `timer-riscv.c`, let's first look at the **11 functions** inside this file, grouped into **3 simple jobs**, and then trace **one complete real-world story with 3 timers (`Timer A`, `Timer B`, `Timer C`)** that calls every single function from start to finish!
+
+---
+
+## PART 1: Plain-English Dictionary of All 11 Functions in `timer-riscv.c`
+
+In `timer-riscv.c`, there are **11 functions** total. They fall into 3 clean groups:
+
+```text
++-------------------------------------------------------------------------------+
+| GROUP 1: HARDWARE CLOCK FUNCTIONS (Talking to 'time' and 'stimecmp' CSRs)     |
++-------------------------------------------------------------------------------+
+| 1. riscv_clocksource_rdtime(cs)                                               |
+|    - Plain English: "Look at the wristwatch ('rdtime') and tell me the        |
+|      current hardware tick number!"                                           |
+|                                                                               |
+| 2. riscv_clock_event_stop()                                                   |
+|    - Plain English: "Silence/turn off the hardware alarm by setting           |
+|      'stimecmp = U64_MAX' (infinity, 0xFFFFFFFFFFFFFFFF)!"                    |
+|                                                                               |
+| 3. riscv_clock_next_event(delta, ce)                                          |
+|    - Plain English: "Set the hardware alarm ('stimecmp') to ring 'delta'      |
+|      ticks from right now (`rdtime() + delta`)!"                              |
+|                                                                               |
+| 4. riscv_clock_shutdown(evt)                                                  |
+|    - Plain English: "Shut down the clockevent device when turning off a CPU   |
+|      (calls riscv_clock_event_stop())."                                       |
++-------------------------------------------------------------------------------+
+| GROUP 2: SOFTWARE TIMER LIST API (Managing struct timer_list on active_timers)|
++-------------------------------------------------------------------------------+
+| 5. timer_setup(timer, callback, flags)                                        |
+|    - Plain English: "Prepare a blank timer card: set its callback function    |
+|      and initialize its list_head ring (`INIT_LIST_HEAD`), but DO NOT start   |
+|      it yet!"                                                                 |
+|                                                                               |
+| 6. mod_timer(timer, expires)                                                  |
+|    - Plain English: "Set the timer's alarm jiffy (`expires`) and clip it onto |
+|      the `active_timers` linked list (or update its time if already on it)!"  |
+|                                                                               |
+| 7. del_timer(timer)                                                           |
+|    - Plain English: "Cancel a timer before it rings! Unclip it from           |
+|      `active_timers` (`list_del`) so its callback never runs."                |
++-------------------------------------------------------------------------------+
+| GROUP 3: BOOT INIT, TOP-HALF INTERRUPT, AND BOTTOM-HALF SOFTIRQ               |
++-------------------------------------------------------------------------------+
+| 8. time_init()                                                                |
+|    - Plain English: "Called once at boot: registers `run_timer_softirq` on    |
+|      `TIMER_SOFTIRQ`, sets the very first 10ms alarm (`100,000` ticks), and   |
+|      flips the interrupt ON-switches (`sie.STIE = 1` and `sstatus.SIE = 1`)." |
+|                                                                               |
+| 9. riscv_timer_interrupt()   [TOP HALF ENTRY]                                 |
+|    - Plain English: "Called by `do_trap()` the instant the hardware timer     |
+|      rings (`scause = 5`). Silences the current alarm and calls               |
+|      `evdev->event_handler` (`tick_handle_periodic`)."                        |
+|                                                                               |
+| 10. tick_handle_periodic(ce) [TOP HALF WORKER]                                |
+|    - Plain English: "Does the 3 fast Top-Half jobs:                           |
+|        (a) `jiffies_64++`                                                     |
+|        (b) Rearms `stimecmp` for the next 10ms jiffy (`100,000` ticks ahead)  |
+|        (c) Calls `raise_softirq(TIMER_SOFTIRQ)` so the Bottom Half will run!" |
+|                                                                               |
+| 11. run_timer_softirq(h)     [BOTTOM HALF WORKER]                             |
+|    - Plain English: "Called by `irq_exit()` -> `__do_softirq()`. Walks        |
+|      `active_timers`, unclips any timer where `jiffies_64 >= timer->expires`, |
+|      and calls `timer->function(timer)`!"                                     |
++-------------------------------------------------------------------------------+
+```
+
+---
+
+## PART 2: One Complete Use-Case Story With 3 Timers (Covers All 11 Functions!)
+
+Imagine our kernel is running a **Smart Car Controller** with **3 software timers**:
+- **`Timer A` (`led_timer`)**: Blink the dashboard status LED at **Jiffy = 1** (`10 ms` from boot).
+- **`Timer B` (`brake_watchdog_timer`)**: Emergency brake timeout set for **Jiffy = 2** (`20 ms` from boot)—*which we will cancel with `del_timer()` at Jiffy = 1 because the driver pressed the pedal in time!*
+- **`Timer C` (`telemetry_timer`)**: Send GPS telemetry at **Jiffy = 3** (`30 ms` from boot).
+
+Let's watch the timeline from **Jiffy = 0 (Boot)** $\rightarrow$ **Jiffy = 1** $\rightarrow$ **Jiffy = 2** $\rightarrow$ **Jiffy = 3** $\rightarrow$ **Shutdown**, seeing how every function in `timer-riscv.c` executes!
+
+---
+
+### ACT 1: Boot Initialization (`time_init`, `riscv_clock_event_stop`, `riscv_clock_next_event`, `riscv_clocksource_rdtime`)
+
+At boot, `jiffies_64 = 0`, and hardware stopwatch `time` is currently at `500,000` ticks.
+`start_kernel()` calls **`time_init()`**:
+
+```text
+INSIDE time_init():
+  1. Checks riscv_timebase == 10,000,000 Hz (from DTB).
+     Calculates ticks_per_jiffy = 10,000,000 / 100 = 100,000 ticks (10 ms).
+
+  2. Calls open_softirq(TIMER_SOFTIRQ, run_timer_softirq):
+     Registers Function #11 (run_timer_softirq) as the Bottom-Half handler!
+
+  3. Calls Function #2: riscv_clock_event_stop():
+     Writes U64_MAX (0xFFFFFFFFFFFFFFFF) to 'stimecmp' CSR (0x14D) to clear any
+     old pending interrupt.
+
+  4. Calls Function #3: riscv_clock_event.set_next_event(100000, &riscv_clock_event)
+     --> which is riscv_clock_next_event(100000, ce):
+         - Reads current hardware time: 500,000
+         - Adds delta (100,000):        next_tval = 600,000
+         - Writes 600,000 to 'stimecmp' CSR (0x14D)!
+
+  5. Enables SIE_STIE (in 'sie') and SR_SIE (in 'sstatus').
+```
+*(And if anyone calls `riscv_clocksource.read(&riscv_clocksource)` right now, **Function #1 `riscv_clocksource_rdtime()`** runs `rdtime` and returns `500,000`!)*
+
+---
+
+### ACT 2: Setting Up and Arming Our 3 Timers (`timer_setup` & `mod_timer`)
+
+Still at **`jiffies_64 = 0`**, our driver sets up `Timer A`, `Timer B`, and `Timer C`:
+
+#### Step 1: Call Function #5 (`timer_setup`) on all 3 timers
+```c
+timer_setup(&timer_A, led_callback, 0);
+timer_setup(&timer_B, brake_watchdog_callback, 0);
+timer_setup(&timer_C, telemetry_callback, 0);
+```
+What does `timer_setup()` do in memory?
+- Sets each timer's `function` pointer.
+- Sets `expires = 0`.
+- Calls `INIT_LIST_HEAD(&timer->entry)` so each timer's `next` and `prev` point to **itself** (meaning `list_empty(&timer->entry)` is **TRUE**—none of them are on `active_timers` yet!).
+
+```text
+AFTER timer_setup() (Not on active_timers yet!):
+  [active_timers] <---> (empty, points to itself)
+
+  [timer_A: func=led_cb]   [timer_B: func=brake_cb]   [timer_C: func=telem_cb]
+```
+
+#### Step 2: Call Function #6 (`mod_timer`) to start all 3 timers!
+```c
+mod_timer(&timer_A, 1);   /* Ring at Jiffy = 1 (10 ms) */
+mod_timer(&timer_B, 2);   /* Ring at Jiffy = 2 (20 ms) */
+mod_timer(&timer_C, 3);   /* Ring at Jiffy = 3 (30 ms) */
+```
+What does `mod_timer(timer, expires)` do?
+1. Sets `timer->expires = expires` (`1`, `2`, and `3`).
+2. Checks `if (list_empty(&timer->entry))` (Is this timer already on `active_timers`? No!).
+3. Calls `list_add_tail(&timer->entry, &active_timers)` to link all 3 timers into the circular chain!
+*(Bonus: What if you called `mod_timer(&timer_C, 5)` again while `timer_C` was already on the list? Because `list_empty(&timer_C.entry)` is FALSE, `mod_timer` simply updates `timer_C.expires = 5` in place without adding a duplicate node!)*
+
+```text
+ACTIVE_TIMERS LIST AT JIFFY = 0:
+
+  [active_timers] <---> [Timer A: exp=1] <---> [Timer B: exp=2] <---> [Timer C: exp=3] <---> [active_timers]
+```
+
+---
+
+### ACT 3: Jiffy = 1 Interrupt Fires! (`riscv_timer_interrupt` $\rightarrow$ `tick_handle_periodic` $\rightarrow$ `run_timer_softirq` $\rightarrow$ `del_timer`)
+
+10 milliseconds pass! The hardware `time` counter reaches `600,000` (`time >= stimecmp`).
+Hardware fires **Supervisor Timer Interrupt (`scause = 5`)** $\rightarrow$ jumps to `handle_exception` $\rightarrow$ `do_trap()`:
+
+```text
+===================================================================================
+1. TOP HALF (Inside do_trap -> irq_enter -> riscv_timer_interrupt):
+===================================================================================
+  a) do_trap() calls irq_enter() (irq_nest_count becomes 1).
+  b) do_trap() calls Function #9: riscv_timer_interrupt():
+     - Calls Function #2: riscv_clock_event_stop() (writes U64_MAX to stimecmp).
+     - Calls evdev->event_handler(evdev) ---> Function #10: tick_handle_periodic()!
+
+  c) Inside Function #10: tick_handle_periodic():
+     - Increments jiffies_64++  --->  jiffies_64 is NOW 1!
+     - Calls Function #3: riscv_clock_next_event(100,000):
+       Writes 600,000 + 100,000 = 700,000 into 'stimecmp' for Jiffy #2!
+     - Calls raise_softirq(TIMER_SOFTIRQ):
+       Sets Bit 1 in 'softirq_pending' bitmap!
+     - Top Half finishes in ~10 instructions!
+
+===================================================================================
+2. BOTTOM HALF (Inside do_trap -> irq_exit -> __do_softirq -> run_timer_softirq):
+===================================================================================
+  a) do_trap() calls irq_exit() (irq_nest_count drops to 0).
+  b) irq_exit() sees softirq_pending != 0 -> calls __do_softirq() -> calls
+     Function #11: run_timer_softirq()!
+
+  c) Inside Function #11: run_timer_softirq() (at jiffies_64 == 1):
+     Walks active_timers using a safe 'next = curr->next' pointer:
+     - Checks Timer A (expires = 1):
+       Is jiffies_64 (1) >= 1? YES! EXPIRED!
+       1. Unlinks Timer A: list_del(&timer_A.entry); INIT_LIST_HEAD(&timer_A.entry);
+       2. Calls Timer A's callback: led_callback(&timer_A)!
+          * Inside led_callback(): Blinks the LED!
+          * And suppose the driver ALSO saw the brake pedal was pressed normally,
+            so inside led_callback() (or main code) we cancel Timer B by calling
+            Function #7: del_timer(&timer_B)!
+     - Checks remaining timers: Timer C (expires = 3):
+       Is jiffies_64 (1) >= 3? NO! Leaves Timer C on the list.
+```
+
+#### Wait — Look Closely at What Function #7 (`del_timer(&timer_B)`) Just Did!
+```c
+int del_timer(struct timer_list *timer)
+{
+    if (!list_empty(&timer->entry)) {
+        list_del(&timer->entry);
+        INIT_LIST_HEAD(&timer->entry);
+        return 1;
+    }
+    return 0;
+}
+```
+1. `Timer B` (`expires = 2`) had **not** expired yet—it was still sitting on `active_timers` waiting for Jiffy = 2!
+2. `del_timer(&timer_B)` checked `!list_empty(&timer_B.entry)` (TRUE, it was active on the list!), called `list_del(&timer_B.entry)` to unclip `Timer B` from `active_timers`, reset its ring with `INIT_LIST_HEAD`, and returned `1`!
+3. Now look at `active_timers` after Jiffy = 1 finishes:
+   - `Timer A` fired and was removed.
+   - `Timer B` was cancelled by `del_timer(&timer_B)` and removed!
+   - **Only `Timer C` (`expires = 3`) is left on `active_timers`!**
+
+```text
+ACTIVE_TIMERS LIST AFTER JIFFY = 1:
+
+  [active_timers] <---> [Timer C: exp=3] <---> [active_timers]
+```
+
+---
+
+### ACT 4: Jiffy = 2 and Jiffy = 3 Interrupts Fire!
+
+1. **At `time = 700,000` (Jiffy = 2)**:
+   - Hardware fires Timer Interrupt (`scause = 5`).
+   - **Top Half** (`riscv_timer_interrupt` $\rightarrow$ `tick_handle_periodic`):
+     - `jiffies_64` becomes **`2`**.
+     - Rearms `stimecmp` to `800,000`.
+     - Calls `raise_softirq(TIMER_SOFTIRQ)`.
+   - **Bottom Half** (`irq_exit` $\rightarrow$ `run_timer_softirq`):
+     - Does `Timer B` fire at Jiffy = 2? **NO!** Because we deleted `Timer B` with `del_timer(&timer_B)` at Jiffy = 1!
+     - Checks `Timer C` (`expires = 3`): `2 >= 3` is FALSE. Nothing fires at Jiffy = 2!
+
+2. **At `time = 800,000` (Jiffy = 3)**:
+   - Hardware fires Timer Interrupt (`scause = 5`).
+   - **Top Half**: `jiffies_64` becomes **`3`**, rearms `stimecmp` to `900,000`, raises `TIMER_SOFTIRQ`.
+   - **Bottom Half** (`run_timer_softirq`):
+     - Checks `Timer C` (`expires = 3`): Is `jiffies_64 (3) >= 3`? **YES!**
+     - Unlinks `Timer C` (`list_del`) and calls `telemetry_callback(&timer_C)`!
+     - Now `active_timers` is completely empty!
+
+---
+
+### ACT 5: CPU Shutdown (`riscv_clock_shutdown`)
+
+Finally, if the system shuts down or takes a CPU core offline, the kernel calls:
+```c
+riscv_clock_event.set_state_shutdown(&riscv_clock_event);
+```
+Which calls **Function #4 (`riscv_clock_shutdown`)** $\rightarrow$ **Function #2 (`riscv_clock_event_stop`)** $\rightarrow$ writes `U64_MAX` (`0xFFFFFFFFFFFFFFFF`) to `stimecmp` so no more timer interrupts fire!
+
+---
+
+### One-Glance Memory Map of All 11 Functions
+
+```text
+  BOOT:
+    time_init()
+      |-- open_softirq(TIMER_SOFTIRQ, run_timer_softirq)
+      |-- riscv_clock_event_stop()          [stimecmp = U64_MAX]
+      +-- riscv_clock_next_event(100000)    [stimecmp = rdtime() + 100000]
+
+  DRIVER SETUP:
+    timer_setup(&t, cb, 0)                  [Initialize blank timer card]
+    mod_timer(&t, expires)                  [Add/update timer on active_timers list]
+    del_timer(&t)                           [Cancel/remove timer from active_timers]
+    riscv_clocksource_rdtime(cs)            [Read current rdtime anytime]
+
+  EVERY 10ms INTERRUPT (scause = 5):
+    do_trap()
+      |-- irq_enter()
+      |-- riscv_timer_interrupt()           [TOP HALF ENTRY]
+      |     |-- riscv_clock_event_stop()
+      |     +-- tick_handle_periodic()      [TOP HALF: jiffies_64++, rearm stimecmp,
+      |                                      raise_softirq(TIMER_SOFTIRQ)]
+      +-- irq_exit()
+            +-- __do_softirq()
+                  +-- run_timer_softirq()   [BOTTOM HALF: walk active_timers, fire
+                                             callbacks where jiffies_64 >= expires!]
+
+  SHUTDOWN:
+    riscv_clock_shutdown()
+      +-- riscv_clock_event_stop()          [stimecmp = U64_MAX]
+```
+
+*(Why did `run_timer_softirq()` save `struct list_head *next = curr->next;` BEFORE calling `list_del(&t->entry)` and `t->function(t)`? Because `list_del(&t->entry)` sets `t->entry.next = NULL`! If you didn't save `curr->next` in a local variable `next` first, the loop wouldn't know where the next timer in the list is! That is the classic Linux `list_for_each_safe` pattern!)*
+
+### Control Flow When the 10 ms Timer Interrupt Fires and ZERO `timer_list` Timers Are Set Up!
+
+That is a super practical question!
+Suppose `time_init()` has enabled the timer interrupt, so the hardware timer fires every **10 ms**, **even when nobody has called `timer_setup()` or `mod_timer()`**!
+
+What is `active_timers` right now?
+Because it was declared at the top of `timer-riscv.c` as:
+```c
+static LIST_HEAD(active_timers);
+```
+`active_timers` is an **empty circular list** where `active_timers.next` points to **`&active_timers` (itself)**!
+
+```text
+WHEN ZERO TIMERS ARE REGISTERED:
+  active_timers.next == &active_timers
+  active_timers.prev == &active_timers
+```
+
+Now let's trace the exact step-by-step control flow when the 10 ms hardware timer interrupt fires!
+
+---
+
+### Step-by-Step Trace (When `active_timers` Is Empty)
+
+```text
+[1. CPU is running normal code (or sleeping in 'wfi' inside start_kernel)]
+      |
+      | 10 milliseconds pass! Hardware 'time' reaches 'stimecmp'!
+      v
+[2. Hardware Trap Entry -> arch/riscv/kernel/entry.S (handle_exception)]
+      - CPU saves PC into 'sepc', sets 'scause = (1UL << 63) | 5', disables IRQs
+      - entry.S saves all 31 registers into 'struct pt_regs' on the stack
+      - Calls C function:  do_trap(regs)
+      |
+      v
+[3. arch/riscv/kernel/traps.c -> do_trap(regs)]
+      - Sees 'is_interrupt == 1' and 'code == 5' (RV_IRQ_TIMER)
+      - Calls irq_enter()            ---> irq_nest_count becomes 1
+      - Calls riscv_timer_interrupt()
+      |
+      v
+[4. TOP HALF: drivers/clocksource/timer-riscv.c -> riscv_timer_interrupt()]
+      - Calls riscv_clock_event_stop() ---> writes U64_MAX to 'stimecmp'
+      - Calls tick_handle_periodic():
+          a) Increments jiffies_64++ (e.g., 0 -> 1)!
+             (Even with zero software timers, the OS MUST still keep counting
+              jiffies_64 every 10 ms so the system knows how much time has passed!)
+          b) Calls riscv_clock_next_event(100,000):
+             Writes 'rdtime() + 100,000' to 'stimecmp' so the NEXT 10 ms tick
+             will fire 10 ms from now!
+          c) Calls raise_softirq(TIMER_SOFTIRQ):
+             Sets Bit 1 in 'softirq_pending' (softirq_pending = 0x2).
+      - Returns to do_trap()!
+      |
+      v
+[5. BOTTOM HALF: do_trap() calls irq_exit() -> __do_softirq() -> run_timer_softirq()]
+      - irq_exit() decrements irq_nest_count to 0.
+      - Sees softirq_pending == 0x2 (Bit 1: TIMER_SOFTIRQ).
+      - Clears softirq_pending = 0 and calls run_timer_softirq():
+```
+
+Now look at the `while` loop inside **`run_timer_softirq()`** when `active_timers` is empty:
+```c
+static void run_timer_softirq(struct softirq_action *h)
+{
+    (void)h;
+    struct list_head *curr = active_timers.next;
+
+    /* Look at this condition when active_timers is empty: */
+    while (curr != &active_timers) {
+        /* ... */
+    }
+}
+```
+What is `active_timers.next` when no timers are registered?
+- `active_timers.next` **IS** `&active_timers`!
+- So `curr` equals `&active_timers` on the very first check!
+- The condition `while (curr != &active_timers)` is immediately **FALSE**!
+- **`run_timer_softirq()` does ZERO loop iterations and returns immediately in 2 CPU instructions!**
+
+```text
+      |
+      v
+[6. Trap Return -> arch/riscv/kernel/entry.S]
+      - do_trap() returns to handle_exception in entry.S
+      - Restores all 31 registers and CSRs from 'struct pt_regs'
+      - Executes 'sret' -> CPU resumes right where it was interrupted!
+```
+
+---
+
+### Summary: What Happened During That 10 ms Tick When No Timers Existed?
+
+1. **`jiffies_64` incremented by `1`** (so the OS wall clock and uptime counter stay accurate).
+2. **`stimecmp` was rearmed for `+100,000` ticks** (so the next 10 ms heartbeat will fire on schedule).
+3. **`run_timer_softirq()` checked `curr != &active_timers`**, saw the list was empty (`active_timers.next == &active_timers`), and returned immediately without doing any work!
+
+*(Bonus insight for interviews: In a basic periodic-tick kernel, this 10 ms heartbeat ticks even when `active_timers` is empty. Later in modern Linux, engineers added `CONFIG_NO_HZ_IDLE` ("Tickless Idle")—where if the CPU is about to sleep in `wfi` and `active_timers` is empty, the kernel doesn't even wake up every 10 ms!)*

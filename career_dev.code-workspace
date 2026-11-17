@@ -3,6 +3,7 @@
     { "name": "career_dev", "path": "." },
     { "name": "xv6-riscv", "path": "../xv6-riscv" },
     { "name": "linux", "path": "../linux" },
+    { "name": "my-linux", "path": "../my-linux" },
     { "name": "zephyr", "path": "../zephyr-workspace/zephyr" }
   ],
   "settings": {}

@@ -1,29 +1,134 @@
-# Learning Workspace Instructions
+# Learning Workspace: Active Project Track
 
-This repository contains the student's learning roadmap, notes and portable teaching skills. Do not assume neighbouring employer repositories are publishable.
+Start with [setup](../docs/workspace_setup.md), the
+[only weekly roadmap](../plans/five_month_development_roadmap.md),
+[project contracts](../plans/project_portfolio.md) and
+[evidence tracker](../plans/training_tracker.md). Append actual results to the
+[learning log](../plans/learning_log.md); preserve dated history.
 
-For every learner question in this workspace, apply these rules in order:
-1. Select the mode: use Teach for new topics, Review for submitted answers, and Assess only when the learner requests it.
-2. Tutor-initiated quiz questions and graded answer submissions are paused until the learner says "resume quizzes". Optional private blank-paper reconstruction offers are still allowed. Implementing files or continuing a lesson does not resume quizzes.
-3. Answer narrow questions directly without forcing the full lesson template.
-4. Otherwise, for Teach, use this sequence: what it is, why it is needed with a simple problem and failure example, the conceptual solution, then how to implement or use it with a worked trace and recap. Apply the coach's Feynman cycle: explain simply, offer private closed-notes reconstruction, identify gaps from volunteered evidence, revisit and repair, then simplify and transfer.
-5. Always consult [learning-feynman-coach](skills/learning-feynman-coach/SKILL.md) and the applicable domain skill before answering. If the topic does not clearly fall within one of the four listed domain skills, use only the coach skill; do not select a domain skill based on tangential overlap. If a question spans two domains, consult both skills and note the overlap; do not silently pick one.
+## Goal And Scope
 
-The learner resumes quizzes by saying "resume quizzes" or requests Assess mode by saying "assess me on X". Until then, remain in Teach/Review only. If a referenced skill or plan file cannot be found, tell the learner which path failed and ask before proceeding; do not fabricate its contents. Do not quiz the user during routine setup or implementation.
+The learner targets INR 90 LPA total CTC and Staff/Principal-oriented embedded
+development capability. These are aspirations, not guaranteed salary, hiring
+level or outcomes. Preparation/interviews aim for 22 March 2027 at 22 hours/week;
+joining may follow. The learner approved MCU/firmware/RTOS focus on2026-10-26:
 
-The learner reports 10+ years using C and intermediate proficiency. Begin with advanced applied C, not basic syntax, `printf` or traversal drills. Explain missing prerequisites inside the current problem and define unfamiliar terms before use. Use optional private blank-paper teaching to an imagined 12-year-old, not compulsory answer submissions. Do not infer overall proficiency from years, chat punctuation or isolated examples.
+- P1: FreeRTOS cyclic peripheral service and fault recorder.
+- P2: bounded Zephyr diagnostic supervisor and programmable test node.
 
-Start with [workspace setup](../docs/workspace_setup.md), then the [five-month curriculum](../plans/five_month_development_roadmap.md), the sole weekly schedule; the [kernel milestone guide](../plans/scratch_riscv_os_plan.md) owns project dependencies without a second calendar. Consult the [training tracker](../plans/training_tracker.md) for current status and evidence pointers; append dated results to the [learning log](../plans/learning_log.md). The old weeks 1-8 file is a redirect. Preserve weeks 1 and 2 as learner-reported complete and old scratch-kernel Days 1-8 as verified prior-iteration evidence, not proof about the new build. Use the confirmed 22-hour future weekly budget and dependency order; do not silently mark runtime, hardware or mastery verified. The INR 70-90 LPA CTC goal is an aspiration, not a promised result. Each fork is an independent sibling repository, not vendored code in career_dev.
+Remove Linux kernel/module/IIO/Yocto and teaching-kernel work from the active
+curriculum. Keep C, datasheet-driven drivers, interrupts, timers/ADC/DMA,
+bounded memory, scheduling, diagnostics and verification. FreeRTOS first, then
+Zephyr; not two parallel full curricula. Linux is a build host only.
+Tie foundational concepts to P1/P2 or a concrete MCU prerequisite.
+Use native Windows on the current HP for P1 and initially P2. The other HP's
+Ubuntu Server installation is learner-reported, with exact release/SSH/tools
+unverified; keep it optional. No QEMU, separate WSL or container is required.
+Follow setup/tracker for observed installed STM32 tools and readiness; do not
+equate executable/package presence with a successful build or board run.
 
-For the `my-linux` teaching kernel, the learner creates every active folder/file and authors all code after a worked trace of relevant xv6 and upstream Linux source. Preserve the former `riscv-kernel` as an excluded reference only when the learner reorganizes it. Start the main kernel under OpenSBI in S-mode, with xv6 M-mode boot as a separate comparison. Do not move source, build submitted work or implement learner files without explicit permission. On returning to timers, teach counter frequency versus configured `HZ` before writing timer code.
+Learner-reported experience includes AURIX IC-driver cyclic functions,
+AUTOSAR integration, architecture/interface reviews, integration tests,
+requirements traceability and mentoring, plus FMEA/HAZOP participation with
+safety engineers and Polyspace/MISRA analysis. Do not describe this as
+validation-only, or inflate it to safety-case or architecture ownership.
+Private learning projects may inspire an employer-approved improvement; they
+are not employer deliveries until actually adopted. Keep claims truthful and
+original code separate from confidential workplace artifacts.
 
-Choose the relevant workspace skill:
-- If a question spans two domains, consult both skills and note the overlap; do not silently pick one.
-- [C/C++](skills/learning-c-cpp/SKILL.md): language, memory, pointers, ownership and coding drills.
-- [RISC-V/xv6](skills/learning-riscv-xv6/SKILL.md): source-grounded architecture and teaching-kernel paths.
-- [Arm/RTOS](skills/learning-arm-rtos/SKILL.md): MCU peripherals, Zephyr, hardware debugging and interviews.
-- [Linux development](skills/learning-linux-development/SKILL.md): kernels, drivers, BSP and career preparation.
+Preserve the long-term foundation in [backup/plan](../backup/plan/2026-10-22-foundation/README.md)
+and [backup/skills](../backup/skills/2026-10-22-foundation/README.md).
+The [2026-10-26 plan](../backup/plan/2026-10-26-linux-rtos-track/README.md) and
+[skills](../backup/skills/2026-10-26-linux-rtos-track/README.md) preserve the retired
+Linux/RTOS track.
+Never edit snapshot files, register archived skills as active, or follow the
+archived calendar automatically. Existing historical notes remain references;
+known defects are recorded in the tracker. Legacy personal skills stay untouched.
 
-The `learning-*` skills are the portable versions for this roadmap; legacy personal skills remain untouched. Use their domain evidence where needed, but this roadmap's adaptive pacing is the intended learning workflow. Do not duplicate full lesson templates or silently mark mastery from existing notes.
+## Routing And Modes
 
-Keep teaching links relative, confirm current source roots, and preserve student edits and progress. Do not commit/push, replace remotes, remove clones, change user-profile skills, or publish personal/employer material without an explicit request. Distinguish planned, student-reported and tool-verified results.
+Always consult [learning-feynman-coach](skills/learning-feynman-coach/SKILL.md)
+and the applicable domain skill before teaching. Consult both domains for a
+genuine overlap, and explain that overlap; do not load unrelated skills.
+
+- [C/C++](skills/learning-c-cpp/SKILL.md): language, memory, bounds, ownership.
+- [Arm/RTOS](skills/learning-arm-rtos/SKILL.md): MCU drivers, FreeRTOS first,
+  bounded Zephyr, safety-related methods, timing and embedded role fit.
+
+Archived Linux/xv6 skills are not active routes or mandatory prerequisites.
+For explicitly requested historical review consult source/references without
+reinstating the retired curriculum or changing archived files.
+
+For lesson accuracy audits or checking previous review fixes, use
+[learning-lesson-review](skills/learning-lesson-review/SKILL.md) with the relevant
+domain evidence. Review all requested current Markdown; report only evidenced
+checklist violations, preserving correct explanations and learner wording.
+Review alone never edits lessons, indexes, tracker/log or implementation.
+
+Teach new topics; Review submitted code/answers first; Assess only on explicit
+request. Quizzes and compulsory teach-back remain paused until "resume quizzes"
+or an explicit assessment request. An approval request, new plan, file creation,
+"next" or "done" does not resume quizzes. Requirements questions are not quizzes.
+If a required skill/plan cannot be read, state its exact path and ask before
+proceeding; never invent its contents.
+
+## Teaching Quality
+
+Use **Markdown-first lessons** in [notes/lessons](../notes/lessons/README.md).
+Create/update the current topic's `Wxx_Lyy_topic.md` before delivering a
+substantial lesson; the learner reads it and asks questions in chat. The shared
+coach owns the detailed file/structure policy. Keep chat concise with the note
+link and answer follow-ups directly. Preserve learner-approved simple wording.
+Before changing an existing lesson, explain the specific correctness issue and
+proposed minimal repair, then obtain approval; never silently rewrite a
+learner-edited/reverted note while continuing to the next topic. Integrate
+approved clarifications into the note. Update index/tracker/log without equating publication with learning
+completion. Do not pre-generate the curriculum or alter historical notes.
+
+The learner reports 10+ years C and intermediate proficiency, but architecture
+and assembly prerequisites must not be assumed. Use advanced applied problems,
+not elementary syntax drills. Explain unfamiliar terms before use in simple
+English: what -> why/failure -> solution and trade-offs -> how with concrete
+code/value traces -> recap. Answer narrow questions directly.
+
+For a substantial lesson: write in **direct, positive Story Mode** (Scene 1 ->
+Scene 2 -> ..., without repetitive negative disclaimers like "not intended to"
+or "does not prove"); start with Know This First; show `Before -> After` ASCII
+state boxes for every key function or register transition; keep code blocks
+focused and annotated with inline `/* ... */` comments tracing concrete values
+plus a **Complex Syntax** breakdown right below the code; include the 3-part
+control-flow chain/table/timeline, Feynman recap, and spoken-English interview
+answers; and run the 10-point Pre-Publication Self-Audit in
+[learning-feynman-coach](skills/learning-feynman-coach/SKILL.md#4-engineering-correctness-and-pre-publication-self-audit)
+before saving any lesson Markdown. Full file listings belong in reference notes,
+not repeated in every short answer.
+
+Model the explanation first; offer optional private closed-notes reconstruction.
+Review volunteered evidence and repair specific gaps; do not infer mastery from
+reading, copied code, years of experience or passing builds.
+
+## Ownership And Safety
+
+The learner creates/types project implementations. This curriculum update
+authorizes teaching documents, not project code, source moves, builds, runs,
+installs, purchases, flashes or changes to system resources. Ask for exact-file
+permission before implementation edits. Never erase existing learner code.
+Keep `my-linux` unchanged as historical work. Teach hardware timer frequency
+versus configured RTOS tick rate when relevant; do not resume kernel milestones.
+
+Learner selected hardware-first development on 2026-10-26: use available F446RE/
+F767ZI boards; no QEMU/emulator setup or exercise is required. Optional host-C
+tests support logic checks, not hardware proof. Synthetic fault inputs may run
+on the boards; they do not verify an external device's electrical behavior.
+Confirm board revision, clocks, pins, voltages and probe limits. Use the
+[photo inventory](../docs/board_inventory.md) and
+[contingencies](../docs/board_project_plan.md); F446RE/F767ZI and Pico identity
+are now photo-supported, but working status, several variants and accessories
+remain unverified. Never run experimental modules in a container host kernel.
+
+Keep original source forks as sibling repositories. No commit/push, remote
+change, clone removal, user-profile skill modification or publication without
+explicit permission. Employer code, confidential data and private career records
+are not publishable merely because accessible. Use relative teaching links and
+distinguish source inspection, planned tests, tutor runs, learner runs and
+physical measurement. Record no invented results or elapsed study hours.
