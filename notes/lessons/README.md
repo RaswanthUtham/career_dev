@@ -15,7 +15,7 @@ On2026-10-26 the learner approved FreeRTOS-first MCU/driver development with a
 bounded Zephyr project. Linux kernel/IIO/Yocto lessons are not active
 prerequisites.
 
-**Current topics 10–18 (`W01-L15`..`W03-L23`: Cortex-M4 Architecture -> Bare-Metal -> MPU -> PendSV -> BSP -> C02 Unwind -> FreeRTOS -> C03 Ownership):**
+**Current topics 10–19 (`W01-L15`..`W04-L24`: Cortex-M4 Architecture -> Bare-Metal -> MPU -> PendSV -> BSP -> C02 Unwind -> FreeRTOS -> C03 Ownership -> Synchronization):**
 - **Topic 10 (`W01-L15`):** [Thumb, Arm instruction sets, and important Cortex-M4 instructions](W01_L15_thumb_and_arm_instruction_sets.md).
 - **Topic 11 (`W01-L16`):** [Arm Cortex-M4 important core registers, reset state, and system register blocks](W01_L16_cortexm4_reset_registers.md).
 - **Topic 12 (`W01-L17`):** [Complete bare-metal 84 MHz startup, vector table, B1 interrupt handoff, and LD2 debounce (linker script only)](W01_L17_b1_exti_interrupt_handoff_and_debounce.md).
@@ -25,6 +25,26 @@ prerequisites.
 - **Topic 16 (`W02-L21` — `C02`):** [Three-resource initialization and reverse-order unwind (`C02`) — Linux kernel (`goto`), FreeRTOS, and AUTOSAR / MISRA-C](W02_L21_c02_three_resource_init_and_reverse_unwind.md).
 - **Topic 17 (`W03-L22`):** [FreeRTOS from the ground up — task states, TCB & lists, priorities, `vTaskDelayUntil`, and ISR task notifications (`P1`)](W03_L22_freertos_tasks_states_delays_and_notifications.md).
 - **Topic 18 (`W03-L23` — `C03`):** [Event producer/consumer ownership model (`C03`) — payload lifetime, torn reads, copy queues, and zero-copy slot pools (`P1`)](W03_L23_c03_producer_consumer_payload_ownership.md).
+- **Topic 19 (`W04-L24`):** [FreeRTOS queues, semaphores, mutexes, critical sections and priority inversion (`P1`)](W04_L24_freertos_synchronization_and_priority_inversion.md).
+
+**Review/publication update, 2026-11-17:** L20-L23 were reviewed and repaired
+with approval; the four earlier L17-L19 findings were rechecked. L19's runtime
+frame-padding qualification was restored; the other three fixes were already
+present. C02/C03 now contain explicit failure-reporting checks, but the learner
+selected source review only and will compile them. L24 is a concept/source-trace
+lesson. No new firmware build, board run or learner completion is recorded.
+
+**Requested peripheral & DMA reference, 2026-11-18 (revision 5):**
+[W04-L25: I2C, SPI, ADC and DMA — simple foundations and continuous 4-mode use-case scenarios](W04_L25_i2c_spi_debug_interrupts_and_dma.md).
+Source/document-reviewed, in two parts: **Part I (`Scenes 1–5`)** covers `I2C`,
+`SPI`, `ADC`, generic cross-MCU `DMA` (`STM32` / `AURIX` / `RISC-V`) with
+`Stream` vs. `Channel`, and the 4 step-by-step interrupt paths (`Pin/SYSCFG/EXTI`,
+`SPI/I2C`, `ADC`, `DMA` $\rightarrow$ `NVIC` $\rightarrow$ `CPU`); **Part II
+(`Scenes 6–9`)** pairs generic pseudocode with concise production-style
+`STM32F446RE` CMSIS register code (`{0xAA..0xFF}` on `SPI1` & `I2C1`, and
+`{0x0800, 0x0400, 0x0C00}` on `ADC1`) across CPU Polling, CPU Interrupt, DMA
+Polling, and DMA Interrupt. No target wiring, implementation, build or learner
+completion is recorded; this reference supports the upcoming P1 driver work.
 
 Updated 2026-11-01 under the learner-approved sequential progression:
 `W01-L15` and `W01-L16` cover the Arm Cortex-M4 instruction sets, important

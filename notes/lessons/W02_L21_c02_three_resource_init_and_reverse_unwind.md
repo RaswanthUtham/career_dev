@@ -1,6 +1,6 @@
 # W02-L21: Three-Resource Initialization And Reverse-Order Unwind (`C02`) — Linux Kernel (`goto`), FreeRTOS, And AUTOSAR / MISRA-C
 
-> **Scope & verification status:** `Source-reviewed C02 architecture & coding lesson (2026-11-04): covers Linux kernel centralized goto unwind, FreeRTOS driver/task initialization unwind on STM32 Cortex-M4 (P1), and goto-free AUTOSAR / MISRA C:2012 Rule 15.1 reverse unwind.`
+> **Scope & verification status:** Source-reviewed and repaired 2026-11-17. C02 teaches P1 resource dependencies and reverse unwind. Linux-style and automotive-style code are bounded comparisons, not additional curricula or compliance claims. The standalone host harness has been inspected, not compiled or run; the learner selected source review only.
 
 Previous: [BSP — Board Support Package or Bootstrap Processor](W01_L20_bsp_board_support_and_bootstrap_processor.md).
 
@@ -26,12 +26,20 @@ When you initialize a real peripheral driver (such as our `P1` sensor/fault acqu
 
 Suppose `init()` acquires `R1` (Clock/GPIO) and `R2` (Queue/Buffer), and then **`R3` (Interrupt/Task setup) fails**:
 * You must undo **only what was already acquired (`R2`, then `R1`)** so the system does not leak memory or leave hardware clocks/pins active.
-* You must **NOT** release `R3` (because `R3` failed and was never acquired!).
+* You must **NOT** release `R3` if its acquire function failed without leaving any owned resource behind.
+
+**Contract used by all examples:** Each acquire helper is failure-atomic: it
+either succeeds completely or cleans up its own partial work before returning
+failure. Otherwise the caller needs explicit partial-ownership information.
+Pass a valid, initialized, exclusively managed context; do not initialize an
+already-live instance. Release helpers return only after their users have
+stopped. The simple `deinit()` functions require successful initialization and
+one shutdown; only the ownership-mask variant skips already-released resources.
 
 And what if all 3 succeed (`R1`, `R2`, `R3`), and later `deinit()` shuts the driver down?
 * You **MUST** release them in **strict reverse order (`R3 -> R2 -> R1` — Last-In, First-Out `LIFO`)**:
-  1. **First, disable `R3` (Interrupt/Trigger):** Stop the ISR from firing.
-  2. **Second, free `R2` (Buffer/Queue):** Now that no ISR can fire, it is safe to free/delete the queue or DMA buffer.
+  1. **First, stop `R3` (Interrupt/Trigger and its users):** Prevent new work and establish quiescence: all DMA, workers and callbacks have stopped accessing the resources.
+  2. **Second, free `R2` (Buffer/Queue):** Once no user can access it, free/delete the queue or DMA buffer. An interrupt mask alone does not stop DMA or deferred work.
   3. **Third, disable `R1` (Clock/GPIO):** Finally, gate off the peripheral clock and reset the pins.
 
 * **Otherwise (What Fails If You Unwind in Forward Order `R1 -> R2 -> R3`?):**
@@ -43,14 +51,15 @@ FORWARD ACQUISITION ORDER (init):
   [R1: Clock & GPIO] ---> [R2: Buffer / Queue] ---> [R3: Enable Interrupt (Last!)]
 
 REVERSE UNWIND ORDER (on init failure OR deinit shutdown):
-  [R3: Disable Interrupt (First!)] ---> [R2: Free Buffer / Queue] ---> [R1: Disable Clock & GPIO]
+  [R3: Stop + quiesce all users] ---> [R2: Free Buffer / Queue] ---> [R1: Disable Clock & GPIO]
 
   If R1 fails: Undo nothing (return error immediately)
   If R2 fails: Undo R1 only
   If R3 fails: Undo R2 first, then undo R1
 ```
 
-Below are the **three industry-standard ways** to implement this exact contract in **Linux Kernel C (`goto`)**, **FreeRTOS (`P1`)**, and **AUTOSAR / MISRA-C (where `goto` is prohibited)**.
+Below are three ways to express this contract: **Linux-style C (`goto`)**,
+**FreeRTOS (`P1`)**, and **a project rule that avoids `goto` in MISRA-oriented C**.
 
 ---
 
@@ -69,7 +78,7 @@ In the Linux kernel (`Documentation/process/coding-style.rst`, Chapter 7), drive
 4. **How the Reverse Labels Fall Through at the Bottom:**
    * `err_release_r2:` releases `R2`, and then **falls straight through** to `err_release_r1:`, which releases `R1` and returns the negative error code (`ret`)!
    * **Rule for Label Names:** Name each label after **what that label undoes** (`err_release_r2:`, `err_release_r1:`), never after what failed (`err_r3_failed:`), so anyone reading the `goto` sees immediately which cleanup step runs first.
-   * **Never use a single `goto cleanup;` label** unless every resource pointer is initialized to `NULL` and guarded with `if (ptr != NULL)`—and even then, separate reverse labels are preferred in kernel drivers because hardware steps like `clk_disable()` or `free_irq()` are not simple `NULL`-checked pointers.
+   * A shared `cleanup` label is also valid when it checks reliable ownership flags or stages. A reverse-label ladder makes the successfully acquired subset explicit without those extra checks.
 
 ```text
 Linux Kernel Reverse `goto` Ladder Flow:
@@ -176,8 +185,9 @@ In a FreeRTOS driver on `STM32F446RE` (`P1`), the 3 resources are typically:
 
 1. **Never enable the `NVIC` interrupt before `xQueueCreate()` and `xTaskCreate()` succeed:**
    * If you enable `NVIC_EnableIRQ(EXTI15_10_IRQn)` in Step 1, and an interrupt fires *before* `xQueueCreate()` runs in Step 2, the ISR calls `xQueueSendFromISR(NULL, ...)` and **crashes immediately (`HardFault` / `configASSERT`)**!
-2. **During `deinit()` or failure unwind, mask the hardware interrupt (`NVIC_DisableIRQ` + `__DSB()` + `__ISB()`) BEFORE calling `vTaskDelete()` or `vQueueDelete()`:**
-   * Calling `vQueueDelete(ctx->queue)` while `EXTI15_10_IRQn` is still enabled in `NVIC` is a classic race condition: if an edge arrives, the ISR writes to a deleted queue!
+2. **During `deinit()`, stop new work and quiesce every user BEFORE calling `vTaskDelete()` or `vQueueDelete()`:**
+   * Masking the hardware interrupt is one step. `vTaskDelete()` does not release application allocations, mutexes or DMA ownership. A worker must acknowledge shutdown and park without holding these resources before another task deletes it.
+   * Calling `vQueueDelete(ctx->queue)` while an ISR, worker or callback can still use it is a use-after-free.
 
 ```text
 FreeRTOS Driver Init & Unwind Order on STM32 Cortex-M4:
@@ -191,12 +201,27 @@ FreeRTOS Driver Init & Unwind Order on STM32 Cortex-M4:
         (If xTaskCreate fails -> vQueueDelete(R2) -> Disable Clock/GPIO(R1))
 
   DeInit Order (Reverse LIFO):
-    1. NVIC_DisableIRQ(IRQ40) + __DSB() + __ISB() + vTaskDelete(ctx->task)  [Stop R3 first!]
+    1. Mask IRQ -> bounded stop/quiesce -> delete parked worker          [Stop R3 first!]
+       On quiesce failure: report failure; retain queue, task and hardware.
     2. vQueueDelete(ctx->queue)                                             [Free R2 second!]
     3. Disable RCC Clock + Reset GPIO                                       [Stop R1 last!]
 ```
 
 ### Method 2 Code: FreeRTOS Driver Init and Reverse Unwind
+
+This is interface pseudocode; a real build uses `FreeRTOS.h`, `task.h` and
+`queue.h`, not the representative declarations below. Run init from task
+context with the scheduler running and a zero-initialized, non-live context.
+`xTaskCreate()` may immediately run the worker: its first action must be to wait
+on the already-created queue, without using the not-yet-published task handle.
+The caller serializes init/deinit. Deinit runs in a separate control task,
+never in the worker being deleted or in an ISR.
+
+`p1_stop_and_quiesce()` is a required driver-specific helper: stop triggers,
+complete/cancel DMA, drain or explicitly discard owned work, and obtain a
+bounded worker acknowledgment that it is parked and holds no resources.
+On failure, return `false` and keep resources allocated for recovery. C04 will
+develop that shutdown protocol; this lesson shows where it belongs.
 
 ```c
 #include <stdbool.h>
@@ -226,6 +251,7 @@ BaseType_t    xTaskCreate(void (*fn)(void *), const char *name,
 void          vTaskDelete(TaskHandle_t t);
 void          stm32_irq_enable(freertos_drv_ctx_t *ctx);
 void          stm32_irq_disable_sync(freertos_drv_ctx_t *ctx);
+bool          p1_stop_and_quiesce(freertos_drv_ctx_t *ctx);
 void          p1_worker_task(void *arg);
 
 bool freertos_driver_init(freertos_drv_ctx_t *ctx)
@@ -255,10 +281,13 @@ bool freertos_driver_init(freertos_drv_ctx_t *ctx)
     return true;
 }
 
-void freertos_driver_deinit(freertos_drv_ctx_t *ctx)
+bool freertos_driver_deinit(freertos_drv_ctx_t *ctx)
 {
-    /* 1. Stop R3 first: mask NVIC IRQ + barrier BEFORE deleting task or queue! */
+    /* 1. Stop R3: masking alone is insufficient; every owner must be quiescent. */
     stm32_irq_disable_sync(ctx);
+    if (!p1_stop_and_quiesce(ctx)) {
+        return false;                  /* Caller records failure; ownership retained. */
+    }
     if (ctx->worker_task != (TaskHandle_t)0) {
         vTaskDelete(ctx->worker_task);
         ctx->worker_task = (TaskHandle_t)0;
@@ -272,18 +301,22 @@ void freertos_driver_deinit(freertos_drv_ctx_t *ctx)
 
     /* 3. Release R1 last: gate off STM32 peripheral clock & pins: */
     stm32_hw_release(ctx);
+    return true;
 }
 ```
 
 ---
 
-## Method 3 — How It Is Done Where `goto` Is Prohibited (AUTOSAR OS / MISRA C:2012 Rule 15.1)
+## Method 3 — How It Is Done When Project Rules Avoid `goto` (MISRA-Oriented C)
 
-### Why Is `goto` Prohibited in AUTOSAR / Automotive Safety Firmware?
+### Why Do Some Automotive Projects Avoid `goto`?
 
 In automotive firmware (AURIX / AUTOSAR Classic OS / ISO 26262 with **MISRA C:2012**):
-* **MISRA C:2012 Rule 15.1** states: *"The `goto` statement should not be used."*
+* **MISRA C:2012 Rule 15.1 is Advisory:** it recommends avoiding `goto`.
 * **MISRA C:2012 Rule 15.5** (Advisory, often enforced by company guidelines) also prefers a **single point of exit (`return`)** at the end of a function so static analysis tools (Polyspace, LDRA, QA-C) can verify all control-flow paths easily.
+* The project's adopted rules and compliance process determine enforcement.
+  AUTOSAR or ISO 26262 alone does not make every `goto` forbidden. Avoiding
+  `goto` and using one return do not establish whole-program MISRA compliance.
 
 ### How Do We Write Clean Reverse Unwind Without `goto` (And Without Deep Nested `if` Pyramids)?
 
@@ -301,7 +334,7 @@ At Staff/Principal level in AUTOSAR Complex Device Drivers (`CDD`), we solve thi
   * **Zero `goto` statements** (passes MISRA Rule 15.1).
   * **Single `return status;` exit** (passes MISRA Rule 15.5).
   * **Zero duplicated teardown code** between `Cdd_Init()` failure and `Cdd_DeInit()`.
-  * **Flat cyclomatic complexity** (no nested `if/else` pyramid).
+  * **Reduced nesting depth** (no deeply nested `if/else` pyramid). Cyclomatic complexity counts control-flow decisions; flatter indentation does not remove those decisions.
 
 ```text
 AUTOSAR / MISRA-C `goto`-Free Pattern:
@@ -366,7 +399,7 @@ static void Cdd_UnwindOwnedResources(Cdd_DriverCtxType *ctx)
     }
 }
 
-/* MISRA C:2012 compliant Init: zero `goto`, flat control flow, single return: */
+/* Init illustrating Rule 15.1/15.5 recommendations, not full MISRA compliance: */
 Std_ReturnType Cdd_Init(Cdd_DriverCtxType *ctx)
 {
     Std_ReturnType status = E_OK;
@@ -419,7 +452,13 @@ void Cdd_DeInit(Cdd_DriverCtxType *ctx)
 
 ## Complete Runnable C02 Verification Code (Tests All 4 Failure/Success Cases)
 
-You can compile and run this standalone C file with any C compiler (`gcc -std=c11 -Wall -Wextra -Werror c02_unwind_test.c -o c02_unwind_test`) or step through it on target to verify both the **Linux `goto` pattern** and the **AUTOSAR/MISRA `goto`-free pattern** across all 4 fault-injection cases:
+This standalone hosted C11 file checks both unwind patterns across four cases.
+Suggested learner command for a host GCC toolchain:
+`gcc -std=c11 -Wall -Wextra -Werror c02_unwind_test.c -o c02_unwind_test.exe`,
+then `.\c02_unwind_test.exe` in PowerShell. A target run additionally needs
+startup and output support. Expected: eight `PASS` lines and exit status `0`;
+any failed check returns `1`. These are sequential resource models, not
+DMA/worker-shutdown tests.
 
 ```c
 #include <stdbool.h>
@@ -600,20 +639,38 @@ bool misra_no_goto_init(c02_harness_t *h)
 int main(void)
 {
     c02_harness_t h;
+    bool all_pass = true;
 
-    /* Test all 4 cases (fail_step = 1, 2, 3, and 0 = full success + deinit): */
-    for (uint8_t step = 0U; step <= 3U; ++step) {
-        harness_reset(&h, step);
-        bool ok = misra_no_goto_init(&h);
-        if (ok) {
-            misra_unwind_owned(&h);
+    /* Both implementations: success + deinit, then fail R1, R2 and R3. */
+    for (unsigned variant = 0U; variant < 2U; ++variant) {
+        for (uint8_t step = 0U; step <= 3U; ++step) {
+            harness_reset(&h, step);
+            bool ok = (variant == 0U) ? linux_goto_init(&h)
+                                      : misra_no_goto_init(&h);
+            uint8_t expected = (step == 0U) ? 3U : (uint8_t)(step - 1U);
+            bool pass = (ok == (step == 0U));
+            if (ok) {
+                pass = pass && (h.live_hw_mask == 7U);
+                if (variant == 0U) {
+                    linux_goto_deinit(&h);
+                } else {
+                    misra_unwind_owned(&h);
+                }
+            }
+            pass = pass && (h.live_hw_mask == 0U) && (h.owned_mask == 0U)
+                        && (h.acquire_count == expected)
+                        && (h.release_count == expected)
+                        && !h.order_violation && !h.unowned_release;
+            for (uint8_t i = 0U; i < expected; ++i) {
+                pass = pass && (h.acquire_log[i] == (uint8_t)(i + 1U))
+                            && (h.release_log[i] == (uint8_t)(expected - i));
+            }
+            printf("%s step=%u: %s\n", variant == 0U ? "goto" : "guarded",
+                   (unsigned)step, pass ? "PASS" : "FAIL");
+            all_pass = all_pass && pass;
         }
-        printf("Step %u: init_ok=%d live_mask=0x%02X acquired=%u released=%u "
-               "order_err=%d unowned_err=%d\n",
-               step, ok, h.live_hw_mask, h.acquire_count, h.release_count,
-               h.order_violation, h.unowned_release);
     }
-    return 0;
+    return all_pass ? 0 : 1;
 }
 ```
 
@@ -638,3 +695,11 @@ Trace both implementations when **`R1` and `R2` succeed, and `R3` fails (`fail_a
      2. Checks `RES_R2_BUFFER` (`0x02`): bit is **`1`**, so it calls `release_r2()` (`release_log[0] = 2`) and clears bit `1`.
      3. Checks `RES_R1_CLK_GPIO` (`0x01`): bit is **`1`**, so it calls `release_r1()` (`release_log[1] = 1`) and clears bit `0`.
    * **Final State:** `live_hw_mask == 0x00` (zero leaked resources), `release_log = {2, 1}` (exact reverse order), `order_violation == false`, `unowned_release == false`!
+
+## Corrections
+
+- 2026-11-17: Approved source-only repair: failure-atomic acquire and quiescent
+  teardown contracts, bounded worker-stop failure, advisory MISRA rules versus
+  project compliance, nesting versus cyclomatic complexity, and checks for both
+  host unwind variants with failing exit status. Expected harness output is
+  specified; compilation and execution remain for the learner.

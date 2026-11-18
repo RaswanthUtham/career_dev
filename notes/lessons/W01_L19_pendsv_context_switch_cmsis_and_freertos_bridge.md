@@ -9,14 +9,24 @@ Previous: [Bare-metal Cortex-M4 privilege (`CONTROL`), `PSP` vs. `MSP`, `MPU` me
 
 ## The Core Idea: How One CPU Runs Two Tasks (`PUSH` To Pause, `POP` To Resume)
 
-Our STM32F446RE has **one** Cortex-M4 CPU core with **one** set of 16 registers (`R0..R12, SP, LR, PC, xPSR`), but we want to run **two independent `for (;;)` functions**:
+Our STM32F446RE has **one** Cortex-M4 CPU core with **one** set of 16 core registers (`R0..R12, SP, LR, PC`), plus the `xPSR` status register, but we want to run **two independent `for (;;)` functions**:
 * **Task 0 (`task_button_check`):** Checks if button `B1` (`PC13`) was pressed and changes `blink_period_ms` (`500 ms <-> 150 ms`).
 * **Task 1 (`task_led_blink`):** Toggles `LD2` (`PA5`) every `blink_period_ms` milliseconds.
 
 To share one CPU between two tasks, each task gets its own stack in RAM (`task0_stack` and `task1_stack`) using the **Process Stack Pointer (`PSP`)**, while `main()` and interrupt handlers use the **Main Stack Pointer (`MSP`)**:
 
-1. **To pause a running task (Task 0):** We **PUSH (save)** all 16 of Task 0's current CPU registers onto `task0_stack`, and save Task 0's stack pointer address in `g_tcbs[0].psp`.
-2. **To run the other task (Task 1):** We load Task 1's saved stack pointer from `g_tcbs[1].psp` and **POP (restore)** all 16 of Task 1's registers from `task1_stack` into the CPU.
+1. **To pause a running task (Task 0):** We **PUSH (save)** 16 words of Task 0's integer context onto `task0_stack`, and save Task 0's stack pointer address in `g_tcbs[0].psp`.
+2. **To run the other task (Task 1):** We load Task 1's saved stack pointer from `g_tcbs[1].psp` and **POP (restore)** those 16 saved words from `task1_stack` into the CPU.
+
+**Frame contract for the diagrams below:** The initial frame is 16 words
+(`64 bytes`): `R4..R11` plus `R0..R3, R12, LR, PC, xPSR`. `SP` is tracked
+separately in the TCB. At runtime, with `STKALIGN = 1`, an exception taken when
+`PSP` is only 4-byte aligned adds one padding word above the stacked `xPSR`;
+stacked `xPSR[9] = 1` tells exception return to remove it. That integer context
+occupies `68 bytes`, although the 16 saved register words keep their offsets.
+The custom switcher assumes no active floating-point context (`FPCA = 0`).
+An extended FP frame (`EXC_RETURN[4] = 0`) needs additional hardware and software
+FP preservation, as handled by the FreeRTOS CM4F port.
 
 ### Why Are the 16 Registers Split Into 8 Hardware Words + 8 Software Words?
 
@@ -55,7 +65,7 @@ Normal Context Switch When Task 0 Is Already Running:
 Before the scheduler starts in `main()`, **neither Task 0 nor Task 1 has ever run yet**.
 If we want to start Task 0 (or switch into Task 1 for the first time) by **popping** 16 registers off its stack, those 16 registers **must already be sitting on its stack**!
 
-So in `main()`, we call `task_stack_init()` to **push 16 initial words (`64 bytes`)** onto the top of `task0_stack` and `task1_stack` by hand in C (`*(--sp) = ...`). That makes a brand-new task's stack look **identical** to a task that was already paused by an interrupt.
+So in `main()`, we call `task_stack_init()` to **push 16 initial words (`64 bytes`)** onto the top of `task0_stack` and `task1_stack` by hand in C (`*(--sp) = ...`). That makes a brand-new task's stack match the basic integer frame of a paused task without alignment padding.
 
 ### What Is the Difference Between `Return_PC` (`sp[14]`) and `LR` (`sp[13]`)?
 
@@ -990,3 +1000,10 @@ STM32 EXTI Peripheral (Outside CPU)              Arm Cortex-M4 NVIC & Core (Insi
 | `SysTick_Handler` (`++app_ms; SCB->ICSR = PENDSVSET`) | `xPortSysTickHandler()` -> `xTaskIncrementTick()` | Wakes sleeping tasks when their `vTaskDelay` / `vTaskDelayUntil` tick deadline expires |
 | `b1_irq_pending = 1U; SCB->ICSR = PENDSVSET` + task checking flag | Task calls `ulTaskNotifyTake()` -> ISR calls `xTaskNotifyFromISR()` + `portYIELD_FROM_ISR()` | Task sleeps in the **Blocked** state (`0% CPU`) until the ISR wakes it |
 | `__disable_irq()` (`PRIMASK`) | `taskENTER_CRITICAL()` (`BASEPRI`) | Masks only priorities numerically `>= configMAX_SYSCALL_INTERRUPT_PRIORITY` (e.g., `5..15`), leaving `0..4` unmasked |
+
+## Corrections
+
+- 2026-11-17: Approved source-only repair: distinguish 16 saved integer words
+  from the architectural register count and qualify runtime STKALIGN padding
+  and FP context. Rechecked SVC selection through EXC_RETURN and both sides of
+  the notification mapping; those earlier corrections remain present.

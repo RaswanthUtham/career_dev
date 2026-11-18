@@ -1,6 +1,6 @@
 # W03-L22: FreeRTOS From The Ground Up — Task States, TCB & Lists, Priorities, `vTaskDelayUntil`, And ISR Task Notifications (`P1`)
 
-> **Scope & verification status:** `Source-reviewed FreeRTOS architecture & P1 vertical-slice lesson (2026-11-04): covers FreeRTOS tasks.c / ARM_CM4F port.c internals, TCB & list mechanics, Cortex-M4 BASEPRI / configMAX_SYSCALL_INTERRUPT_PRIORITY rules, vTaskDelayUntil, and ulTaskNotifyTake / vTaskNotifyGiveFromISR on NUCLEO-F446RE.`
+> **Scope & verification status:** Source-reviewed and repaired 2026-11-17 against the FreeRTOS V10.3.1 task/CM4F port source bundled with STM32CubeF4 V1.28.3. This is a proposed P1 integration, not an installed or running RTOS application. No compilation, execution or timing measurement was performed. Times below are illustrative ticks at a configured 1 kHz.
 
 Previous: [Three-resource initialization and reverse-order unwind (`C02`)](W02_L21_c02_three_resource_init_and_reverse_unwind.md).
 
@@ -8,11 +8,11 @@ Previous: [Three-resource initialization and reverse-order unwind (`C02`)](W02_L
 
 ## The Core Idea: What FreeRTOS Adds On Top Of Our `W01-L19` `PendSV` Switcher
 
-In [W01-L19](W01_L19_pendsv_context_switch_cmsis_and_freertos_bridge.md), we built a working 2-task context switcher using `SVC_Handler` and `PendSV_Handler`. However, it had one big limitation:
+In [W01-L19](W01_L19_pendsv_context_switch_cmsis_and_freertos_bridge.md), we studied a 2-task context-switcher example using `SVC_Handler` and `PendSV_Handler`. However, it had one big limitation:
 * Both `Task 0` (Button) and `Task 1` (LED) ran inside `for (;;)` loops that **never slept**.
 * Even when the button was not pressed and the LED did not need to toggle for another `499 ms`, `PendSV_Handler` kept switching between `Task 0` and `Task 1` thousands of times per second (**burning 100% CPU**).
 
-**FreeRTOS uses the exact same `SVC_Handler` and `PendSV_Handler` assembly instructions you learned in `W01-L19`**, and adds **four kernel mechanisms** in C (`tasks.c`) so waiting tasks use **0% CPU**:
+**FreeRTOS uses the same Cortex-M exception/stack-switching mechanisms**, with additional port logic such as per-task `EXC_RETURN` and conditional FP saves. It adds **four kernel mechanisms** in C (`tasks.c`) so Blocked tasks consume no execution time. The Idle task and interrupts still execute; low-power sleep needs separate idle/tickless configuration.
 
 1. **Four Task States (`Running`, `Ready`, `Blocked`, `Suspended`) and Separate Kernel Lists:**
    * `PendSV_Handler` (`vTaskSwitchContext()`) **only** picks tasks that are in the **`Ready` list**.
@@ -21,11 +21,11 @@ In [W01-L19](W01_L19_pendsv_context_switch_cmsis_and_freertos_bridge.md), we bui
    * Instead of alternating `0 -> 1 -> 0 -> 1`, FreeRTOS always runs the **highest-priority `Ready` task**.
    * If both the Button Task and the LED Task are `Blocked` (asleep), FreeRTOS runs the built-in **`Idle Task` (`Priority 0`)**.
 3. **Sorted Wakeup Lists for `vTaskDelayUntil()` (`pxDelayedTaskList` & `pxOverflowDelayedTaskList`):**
-   * When the LED task calls `vTaskDelayUntil(&xLastWakeTime, 500)`, FreeRTOS calculates its exact wakeup tick (`xLastWakeTime + 500`), moves the task into the **`Blocked` Delayed List**, and switches away.
+   * When the LED task calls `vTaskDelayUntil(&xLastWakeTime, 500)`, FreeRTOS calculates its scheduled release tick (`xLastWakeTime + 500`). If that tick is still in the future, it moves the task into a delayed list and switches away; a late call does not block.
    * When `SysTick_Handler` (`xTaskIncrementTick()`) reaches that tick, it moves the LED task back to the **`Ready` List**!
 4. **Built-In Task Notifications (`ulTaskNotifyTake` + `vTaskNotifyGiveFromISR`):**
    * Every FreeRTOS task has a built-in 32-bit notification counter (`ulNotifiedValue`) inside its Task Control Block (`TCB`).
-   * The Button task calls `ulTaskNotifyTake()` and sleeps in the **`Blocked` state (`0% CPU`)** until `EXTI15_10_IRQHandler` calls `vTaskNotifyGiveFromISR()`, which moves the Button task to **`Ready`** and sets `PENDSVSET` (`portYIELD_FROM_ISR`) so the Button task runs immediately!
+   * If its counter is zero, the Button task waits in `ulTaskNotifyTake()`. An ISR notification then makes it **Ready**. `portYIELD_FROM_ISR()` requests a switch when appropriate; the task runs when interrupt masks, active interrupts and scheduling permit. A notification received before the wait remains pending, so the next take can return without blocking.
 
 ```text
 What Changes From W01-L19 (Busy Polling) to W03-L22 (FreeRTOS States):
@@ -52,7 +52,7 @@ In FreeRTOS (`tasks.c`), `tskTCB` starts with that **exact same `pxTopOfStack` p
 | `tskTCB` Field (`tasks.c`) | What It Stores | Why FreeRTOS Needs It |
 | --- | --- | --- |
 | **`volatile StackType_t *pxTopOfStack`** (`+0x00`) | Saved `PSP` address (points to `R4` on the task's stack when suspended) | **Must be the 1st field in `tskTCB`** so `xPortPendSVHandler` assembly can read/write `[r2]` (`pxCurrentTCB->pxTopOfStack`) with zero offset. |
-| **`ListItem_t xStateListItem`** | Linked-list node for the task's **current state** | Placed in **one** list at a time: `pxReadyTasksLists[prio]` (when `Ready`/`Running`), `pxDelayedTaskList` (when `Blocked` on time), or `xSuspendedTaskList` (when `Suspended`). |
+| **`ListItem_t xStateListItem`** | Linked-list node for the task's **current state** | Placed in one state list: ready, delayed/overflow-delayed, or suspended list. The suspended list also stores indefinite event waits; list membership alone does not distinguish an explicitly Suspended task from a Blocked one. |
 | **`ListItem_t xEventListItem`** | Linked-list node for **event waiting** | When a task blocks on a Queue or Mutex with a timeout, `xStateListItem` sits in `pxDelayedTaskList` (for the timeout) while `xEventListItem` sits in the Queue's waiting list! |
 | **`UBaseType_t uxPriority`** | Task priority (`0` = lowest, `configMAX_PRIORITIES - 1` = highest) | Tells the scheduler which `pxReadyTasksLists[uxPriority]` bucket this task belongs to. |
 | **`StackType_t *pxStack`** | Lowest address of the task's stack array (`&stack[0]`) | Used by `configCHECK_FOR_STACK_OVERFLOW` to detect if `pxTopOfStack` grew below `pxStack`. |
@@ -64,8 +64,8 @@ In FreeRTOS (`tasks.c`), `tskTCB` starts with that **exact same `pxTopOfStack` p
 
 1. **`Ready`:** The task is able to run, and its `xStateListItem` is inside `pxReadyTasksLists[uxPriority]`, waiting only because a higher- or equal-priority task is currently using the CPU.
 2. **`Running`:** The task currently owns the CPU (`pxCurrentTCB` points to this task's `TCB`, and the CPU's `PSP` points to this task's stack). On our single-core Cortex-M4, **at most one task is `Running` at any instant**.
-3. **`Blocked` (`0% CPU`):** The task called a waiting API (`vTaskDelay`, `vTaskDelayUntil`, `ulTaskNotifyTake`, `xQueueReceive`). FreeRTOS **removes** its `xStateListItem` from `pxReadyTasksLists` and places it into `pxDelayedTaskList` (or an event list). The scheduler **never schedules a `Blocked` task** until the event or timeout moves it back to `Ready`!
-4. **`Suspended` (`0% CPU`):** Paused indefinitely by `vTaskSuspend()` (no timeout); only `vTaskResume()` moves it back to `Ready`.
+3. **`Blocked` (`0% CPU`):** A waiting API could not complete immediately and has a nonzero wait. Its state node leaves the ready list for a delayed list or, for an indefinite wait, the suspended list. Queue/semaphore waits also use the separate event node; notifications use their TCB state. A pending notification, available queue item, zero timeout or expired periodic release need not block.
+4. **`Suspended` (`0% CPU`):** Explicitly paused by `vTaskSuspend()`; resumed with `vTaskResume()` or the ISR-safe `xTaskResumeFromISR()`. Resume is not a queued event and is not a replacement for notifications.
 
 ```text
                        vTaskDelayUntil() /
@@ -115,12 +115,12 @@ You must keep **Software Task Priorities** and **Hardware NVIC Interrupt Priorit
 1. **Software Task Priorities (`uxPriority` in FreeRTOS `xTaskCreate`):**
    * **Higher number = Higher urgency!**
    * `Priority 0` (`tskIDLE_PRIORITY`) is the **lowest** urgency; `Priority 2` (`PRIO_BUTTON_TASK`) preempts `Priority 1` (`PRIO_LED_TASK`).
-   * How does FreeRTOS find the highest-priority `Ready` task in 1 CPU cycle? On Cortex-M4 (`configUSE_PORT_OPTIMISED_TASK_SELECTION = 1`), FreeRTOS sets bit `P` in a 32-bit bitmap `uxTopReadyPriority` whenever a task at priority `P` is `Ready`, and uses the single-cycle hardware instruction **`clz` (Count Leading Zeros)**: `31 - __CLZ(uxTopReadyPriority)`!
+   * With `configUSE_PORT_OPTIMISED_TASK_SELECTION = 1`, the Cortex-M4 port uses a ready-priority bitmap and a **`clz` (Count Leading Zeros)** based calculation: `31 - __CLZ(uxTopReadyPriority)`. Finding a bitmap position is only part of selection; scheduling and context switching take additional instructions.
 
 2. **Hardware NVIC Interrupt Priorities (`NVIC_SetPriority` on STM32F446):**
    * **Smaller number = Higher urgency!**
    * `Hardware Priority 0` is the **highest** urgency; `Hardware Priority 15` (`0xF0`) is the **lowest** urgency.
-   * Note that **every hardware ISR (`Priority 0..15`) preempts every Thread-mode task**, regardless of the task's `uxPriority`!
+   * An enabled, pending ISR can preempt Thread mode regardless of the task's `uxPriority`, when `PRIMASK`/`BASEPRI` and exception-priority rules permit it.
 
 3. **How `configMAX_SYSCALL_INTERRUPT_PRIORITY` and `BASEPRI` Work:**
    * When FreeRTOS updates its internal task lists (`pxReadyTasksLists` or `pxDelayedTaskList`) inside `taskENTER_CRITICAL()` or inside a `...FromISR()` function, it **does not disable all interrupts with `PRIMASK`**.
@@ -133,7 +133,7 @@ You must keep **Software Task Priorities** and **Hardware NVIC Interrupt Priorit
 ```text
 CORTEX-M4 HARDWARE NVIC PRIORITIES (Smaller Number = Higher Urgency):
 +-----------------------------------------------------------------------------------+
-| HW Priority 0 .. 4  (0x00..0x40): Zero-Jitter Fast ISRs (NEVER masked by BASEPRI) |
+| HW Priority 0 .. 4  (0x00..0x40): Not masked by this BASEPRI threshold (0x50)    |
 |   -> FORBIDDEN to call any FreeRTOS `...FromISR()` API!                           |
 +===================================================================================+ <-- configMAX_SYSCALL_INTERRUPT_PRIORITY = 5 (0x50)
 | HW Priority 5 .. 14 (0x50..0xE0): FreeRTOS-Safe Peripheral ISRs                   |
@@ -153,6 +153,15 @@ FREERTOS THREAD-MODE TASKS ON PSP (Larger Number = Higher Urgency!):
 
 ### Step 2 Code: `FreeRTOSConfig.h` Priority Settings and `NVIC` Setup
 
+Use the following as a configuration excerpt, not a complete configuration
+file. For this example also select preemption, `configMAX_PRIORITIES >= 3`,
+`configUSE_16_BIT_TICKS = 0`, `configTICK_RATE_HZ = 1000`,
+`configCPU_CLOCK_HZ = SystemCoreClock`, task notifications, dynamic allocation,
+and `INCLUDE_vTaskDelayUntil`, `INCLUDE_vTaskDelete`, `INCLUDE_vTaskSuspend`
+all enabled. `INCLUDE_vTaskSuspend = 1` makes `portMAX_DELAY` an indefinite
+wait; otherwise it is a finite maximum tick count. Enable a working
+`configASSERT` for interrupt-priority and configuration checks.
+
 ```c
 /* Key settings in FreeRTOSConfig.h for STM32F446RE (4 priority bits -> PRIGROUP = 3): */
 #define configPRIO_BITS                               4U
@@ -164,7 +173,7 @@ FREERTOS THREAD-MODE TASKS ON PSP (Larger Number = Higher Urgency!):
 #define configMAX_SYSCALL_INTERRUPT_PRIORITY \
     (configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY << (8U - configPRIO_BITS)) /* 0x50 */
 
-/* Setting EXTI15_10 (IRQ 40) to Hardware Priority 5 (0x50) before enabling it: */
+/* Startup excerpt: the receiver and scheduler must be ready before IRQ delivery. */
 static void b1_exti_irq_priority_init(void)
 {
     /* Set PRIGROUP = 3 (all 4 bits are preemption priority; required by FreeRTOS CM4F): */
@@ -173,7 +182,7 @@ static void b1_exti_irq_priority_init(void)
     /* Set IRQ 40 to logical priority 5 (>= configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY): */
     NVIC_SetPriority(EXTI15_10_IRQn, 5U); /* Writes (5U << 4) = 0x50 into NVIC->IP[40] */
     NVIC_ClearPendingIRQ(EXTI15_10_IRQn);
-    NVIC_EnableIRQ(EXTI15_10_IRQn);
+    /* Enable IRQ 40 only after its receiver/startup contract is established. */
 }
 ```
 
@@ -183,12 +192,14 @@ static void b1_exti_irq_priority_init(void)
 
 ### Why Do Periodic Tasks Use `vTaskDelayUntil()` Instead of `vTaskDelay()`?
 
-Suppose our LED task (`vLedPeriodicTask`) wants to run at an exact period (`500 ms` or `150 ms`), and suppose the code inside the loop (or a higher-priority task that preempted it) takes `3 ms` to finish before the delay call is reached:
+Suppose our LED task (`vLedPeriodicTask`) wants releases every `500` or `150`
+ticks. For this illustrative 1 kHz trace, work/preemption consumes `3` ticks,
+and no further scheduling delay occurs when the task becomes Ready:
 
 * **If you call `vTaskDelay(500)` (Relative Delay):**
   * `vTaskDelay(500)` tells FreeRTOS: *"Wake me `500` ticks **from the moment I call `vTaskDelay()`** (`wake_time = xTickCount + 500`)."*
   * Because `3 ms` already passed before `vTaskDelay(500)` was called, the task wakes at `503 ms`, then `1006 ms`, then `1509 ms`—drifting later on every single cycle!
-* **If you call `vTaskDelayUntil(&xLastWakeTime, period_ticks)` (Absolute Deadline Periodic Delay):**
+* **If you call `vTaskDelayUntil(&xLastWakeTime, period_ticks)` (Scheduled Periodic Release):**
   * Before the `for (;;)` loop starts, you initialize `xLastWakeTime = xTaskGetTickCount();` once (for example, `0`).
   * Inside the loop, `vTaskDelayUntil(&xLastWakeTime, 500)` calculates the next wakeup from the **previous scheduled wakeup time**:
     $$\text{xTimeToWake} = \text{xLastWakeTime} + \text{period\_ticks}$$
@@ -197,17 +208,28 @@ Suppose our LED task (`vLedPeriodicTask`) wants to run at an exact period (`500 
 
 ### What `vTaskDelayUntil()` Does Inside FreeRTOS (`tasks.c`)
 
+Steps 2-5 describe a future release. The API always advances the saved schedule,
+but if the release is already due it does not put the task in a delayed list.
+
 1. Adds `xTimeIncrement` (`500`) to `*pxPreviousWakeTime` (`0 + 500 = 500`).
 2. Removes `vLedPeriodicTask`'s `xStateListItem` from `pxReadyTasksLists[1]`.
 3. Sets `xStateListItem.xItemValue = 500` and inserts it into `pxDelayedTaskList` in sorted order (or into `pxOverflowDelayedTaskList` if `xTimeToWake` wrapped past `0xFFFFFFFFUL`).
 4. Sets `SCB->ICSR = SCB_ICSR_PENDSVSET_Msk` so `PendSV_Handler` switches the CPU to the next Ready task (`vLedPeriodicTask` is now **`Blocked` using `0% CPU`**!).
-5. When `SysTick_Handler` (`xTaskIncrementTick()`) increments `xTickCount` to `500`, it sees `500 >= xNextTaskUnblockTime (500)`, moves `vLedPeriodicTask` from `pxDelayedTaskList` back to `pxReadyTasksLists[1]`, and pends `PendSV`!
+5. When the tick reaches `500`, `xTaskIncrementTick()` moves the task to Ready. In this example it outranks Idle, so the port requests a switch. Actual execution can be later because of ISRs, masks or higher-priority tasks.
+
+**Late-work example:** `last = 1000`, `period = 150`, `now = 1200` gives
+`next = 1150`. The call updates `last` to `1150` and returns without blocking.
+Repeated late calls can produce catch-up iterations. Choose catch-up versus
+skipping/rebasing explicitly for a real cyclic service. Require
+`pdMS_TO_TICKS(period_ms) > 0`; conversion truncates and a sub-tick period can
+be zero. A changed blink period affects the next delay calculation, not an
+already-blocked delay.
 
 ```text
 vTaskDelay(500) [Drifts by work time 3 ms each cycle]:
   0 ms --(3ms work)--> calls vTaskDelay(500) at 3 ms ---------> wakes at 503 ms -> 1006 ms!
 
-vTaskDelayUntil(&xLastWakeTime, 500) [Zero cumulative drift]:
+vTaskDelayUntil(&xLastWakeTime, 500) [No work-time drift in scheduled releases]:
   0 ms --(3ms work)--> calls vTaskDelayUntil(&last=0, 500) ---> wakes at 500 ms -> 1000 ms!
 ```
 
@@ -229,7 +251,7 @@ static void vLedPeriodicTask(void *pvParameters)
         led_on      = !led_on;
         GPIOA->BSRR = led_on ? (1UL << 5) : (1UL << (5U + 16U));
 
-        /* 3. Sleep in BLOCKED state (0% CPU) until (xLastWakeTime + period_ticks): */
+        /* 3. Block if the next scheduled release is future; otherwise continue. */
         TickType_t period_ticks = pdMS_TO_TICKS(g_blink_period_ms);
         vTaskDelayUntil(&xLastWakeTime, period_ticks);
     }
@@ -241,6 +263,13 @@ static void vLedPeriodicTask(void *pvParameters)
 ## Step 4 — Sleeping On An Interrupt (`ulTaskNotifyTake` + `vTaskNotifyGiveFromISR`)
 
 ### How Both Sides of a FreeRTOS Task Notification Work Together
+
+The following trace assumes a zero notification counter and a task currently
+waiting in `ulTaskNotifyTake()`. A give increments the counter even when the
+task is Ready, Running or waiting for something else; it only unblocks a
+notification wait. `pdTRUE` clears the accumulated count on a successful take,
+coalescing several edges. A finite timeout returns zero; this example uses the
+indefinite-wait configuration above.
 
 Instead of `vButtonServiceTask` spinning in a loop checking `b1_irq_pending`, we use **both sides** of a FreeRTOS Direct-to-Task Notification:
 
@@ -257,7 +286,7 @@ Instead of `vButtonServiceTask` spinning in a loop checking `b1_irq_pending`, we
      * Because `vButtonServiceTask` (`Task Priority 2`) has a **higher priority** than whatever task was running (`vLedPeriodicTask` at `Priority 1` or `Idle` at `Priority 0`), FreeRTOS sets **`xHigherPriorityTaskWoken = pdTRUE`**!
    * Calls **`portYIELD_FROM_ISR(xHigherPriorityTaskWoken)`**:
      * When `xHigherPriorityTaskWoken == pdTRUE`, this macro writes **`SCB->ICSR = SCB_ICSR_PENDSVSET_Msk`** (`bit 28`)!
-     * The instant `EXTI15_10_IRQHandler` finishes, `PendSV_Handler` runs and switches the CPU **immediately** to `vButtonServiceTask`!
+     * PendSV switches to the highest-priority Ready task when exception priorities and masks permit it. In this trace, that is `vButtonServiceTask`.
 
 ```text
 1. Button Task (Task Prio 2) calls `ulTaskNotifyTake(pdTRUE, portMAX_DELAY)`:
@@ -273,25 +302,41 @@ Instead of `vButtonServiceTask` spinning in a loop checking `b1_irq_pending`, we
         c. Calls `portYIELD_FROM_ISR(xHigherPriorityTaskWoken)`
            - Sets `SCB->ICSR = PENDSVSET`!
                                          |
-3. `EXTI15_10_IRQHandler` exits -> `PendSV_Handler` (HW Prio 15) runs immediately:
+3. `EXTI15_10_IRQHandler` exits -> when eligible, `PendSV_Handler` (HW Prio 15) runs:
    -> Switches PSP to `vButtonServiceTask` (Task Prio 2)!
 ```
 
 ### Step 4 Code: `vButtonServiceTask()` and `EXTI15_10_IRQHandler()`
 
+**Behavior contract:** This is a notification/cooldown demonstration. It accepts
+at most one serviced edge per `200` ticks, suppresses edges during the first
+`200` ticks after boot, and coalesces pending notifications. A held-low button
+at boot produces no new falling edge. Release bounce can also produce a falling
+edge, so this is not the stable-press/stable-release algorithm in
+[L14](W01_L14_b1_button_polling_and_nonblocking_debounce.md). The timestamp is
+the task's service time, not the physical edge time. Production button handling
+must carry over the earlier debounce/rearm contract.
+
+`g_blink_period_ms` is one naturally aligned 32-bit scalar, with one writer and
+one reader on this single-core Cortex-M4/GCC target. Each access is one
+word load/store; the LED task can see either period during a change. `volatile`
+keeps these accesses observable; it does not protect a multi-field invariant or
+make this a portable multi-threaded C synchronization pattern. Use queues or
+properly scoped locking for the shared records introduced in L23/L24.
+
 ```c
 static volatile uint32_t g_accepted_press_count = 0U;
 static volatile uint32_t g_b1_irq_count         = 0U;
 
-/* Consumer Task (Task Priority 2 — Highest): Sleeps at 0% CPU until B1 interrupt arrives: */
+/* Consumer Task (Task Priority 2): blocks when the notification count is zero. */
 static void vButtonServiceTask(void *pvParameters)
 {
     (void)pvParameters;
     TickType_t xLastPressTick = 0U;
 
     for (;;) {
-        /* 1. Wait in BLOCKED state (0% CPU) until EXTI15_10_IRQHandler notifies us:
-         *    pdTRUE clears ulNotifiedValue back to 0 on wakeup. */
+        /* 1. Consume pending notifications, or wait if the count is zero.
+         *    pdTRUE clears the accumulated count on a successful take. */
         (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         /* 2. Woken by interrupt! Apply 200 ms cooldown check: */
@@ -314,14 +359,14 @@ void EXTI15_10_IRQHandler(void)
         EXTI->PR = (1UL << 13);
         ++g_b1_irq_count;
 
-        /* 2. Notify vButtonServiceTask (moves it from Blocked -> Ready): */
+        /* 2. Increment its notification count; unblock a notification wait. */
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
         if (xButtonTaskHandle != NULL) {
             vTaskNotifyGiveFromISR(xButtonTaskHandle, &xHigherPriorityTaskWoken);
         }
 
         /* 3. If vButtonServiceTask has higher priority than the interrupted task,
-         *    set SCB->ICSR = PENDSVSET so PendSV switches to it immediately on exit: */
+         *    request PendSV; it runs when exception priorities and masks permit: */
         portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
     }
 }
@@ -329,9 +374,23 @@ void EXTI15_10_IRQHandler(void)
 
 ---
 
-## Complete FreeRTOS Application Code (`Core/Src/freertos_p1_app.c`)
+## Complete Application-Side Listing (`Core/Src/freertos_p1_app.c`)
 
 Here is the complete FreeRTOS application file combining our CMSIS `84 MHz` clock + GPIO + `EXTI13` setup (with **3-resource initialization order from `W02-L21`**: Hardware Clock/GPIO first -> Tasks created second -> `NVIC` interrupt enabled last!) with `vButtonServiceTask` and `vLedPeriodicTask`:
+
+**Build integration contract:** Use the vendor STM32F446 startup, linker script,
+CMSIS headers and `system_stm32f4xx.c` (the sole definition of `SystemCoreClock`).
+Enter this `main()` from reset on HSI, not after another routine already switched
+to PLL. Include the V10.3.1 kernel, `portable/GCC/ARM_CM4F` port and exactly one
+compatible heap implementation (`heap_4.c` for this dynamic-allocation example).
+Provision heap and task-stack sizes from build/runtime evidence; `256` is
+`StackType_t` words (`1024 bytes` on this port), not a measured sufficient budget.
+Map `vPortSVCHandler` to `SVC_Handler`, `xPortPendSVHandler` to `PendSV_Handler`,
+and `xPortSysTickHandler` to `SysTick_Handler` in the build configuration. Keep
+one definition of each vector handler, one `main()` and one tick owner; do not
+link the earlier custom switcher or HAL SysTick handler alongside them.
+Resolve optional hooks and timer-service requirements against the selected
+configuration before a build.
 
 ```c
 #include <stdbool.h>
@@ -348,7 +407,7 @@ Here is the complete FreeRTOS application file combining our CMSIS `84 MHz` cloc
 #define PRIO_LED_TASK     (tskIDLE_PRIORITY + 1U) /* Task Priority 1 */
 #define PRIO_BUTTON_TASK  (tskIDLE_PRIORITY + 2U) /* Task Priority 2 */
 
-uint32_t SystemCoreClock = 16000000U;
+/* SystemCoreClock is supplied by the vendor system_stm32f4xx.c. */
 
 static TaskHandle_t      xButtonTaskHandle      = NULL;
 static TaskHandle_t      xLedTaskHandle         = NULL;
@@ -522,6 +581,18 @@ int main(void)
 
 ---
 
+## Corrections
+
+- 2026-11-17: Approved source-only repair: pinned the reference/configuration,
+  clarified task-state/list/notification semantics, scheduled versus actual
+  execution and overruns, labelled cooldown limits, removed unsupported timing
+  claims, and specified application integration and symbol ownership.
+- Source anchors: CubeF4 V1.28.3 FreeRTOS `include/task.h` identifies V10.3.1;
+  `tasks.c:vTaskDelayUntil` contains the future-release guard;
+  `portable/GCC/ARM_CM4F/port.c:vPortSVCHandler` restores PSP and EXC_RETURN.
+  The local `queue.c` and `portmacro.h` reads were sandbox-blocked during this
+  review; their complete implementations were not inspected.
+
 ## Complete Scenario Walkthrough: Task States From Boot Through Two Button Presses (`1000 ms` And `1050 ms`)
 
 Trace the exact state (`Running`, `Ready`, `Blocked`) of all 3 tasks (`vButtonServiceTask` Prio 2, `vLedPeriodicTask` Prio 1, `prvIdleTask` Prio 0) from boot:
@@ -542,21 +613,25 @@ Trace the exact state (`Running`, `Ready`, `Blocked`) of all 3 tasks (`vButtonSe
 3. **At `t = 500 ms` (`SysTick_Handler` fires):**
    * `xTaskIncrementTick()` increments `xTickCount` to `500`, sees `vLedPeriodicTask`'s wakeup time (`500`) has arrived, moves `vLedPeriodicTask` from **`Blocked` to `Ready`** (`pxReadyTasksLists[1]`), and sets `PENDSVSET`.
    * `PendSV_Handler` preempts `prvIdleTask` (Prio 0) and runs **`vLedPeriodicTask` (Prio 1)**.
-   * `vLedPeriodicTask` turns `LD2` OFF and calls `vTaskDelayUntil(&xLastWakeTime, 500)` (next wake = `500 + 500 = 1000`), going back to **`Blocked` (`0% CPU`)** in a few microseconds!
+   * `vLedPeriodicTask` turns `LD2` OFF and calls `vTaskDelayUntil(&xLastWakeTime, 500)` (next release = `500 + 500 = 1000`), going back to **`Blocked` (`0% CPU`)**. Execution duration remains unmeasured.
 
 4. **First Button Press at `t = 1000 ms`:**
    * You press `B1` (`PC13` falls). `EXTI15_10_IRQHandler` (HW Prio 5) runs on `MSP`:
      * Clears `EXTI->PR = B1_MASK`.
      * Calls `vTaskNotifyGiveFromISR(xButtonTaskHandle, &xHigherPriorityTaskWoken)` -> moves `vButtonServiceTask` (Prio 2) from **`Blocked` to `Ready`**, and sets `xHigherPriorityTaskWoken = pdTRUE`.
      * Calls `portYIELD_FROM_ISR(pdTRUE)` -> sets `SCB->ICSR = PENDSVSET`.
-   * `EXTI15_10_IRQHandler` exits into `PendSV_Handler` (HW Prio 15), which immediately switches to **`vButtonServiceTask` (Prio 2)**!
+   * When eligible, `PendSV_Handler` (HW Prio 15) switches to **`vButtonServiceTask` (Prio 2)**.
    * `vButtonServiceTask` wakes from `ulTaskNotifyTake()`, checks `(1000 - 0) >= 200` (**TRUE**), sets `xLastPressTick = 1000`, increments `g_accepted_press_count` (`1`), changes `g_blink_period_ms` to **`150U`**, loops around, and goes right back to **`Blocked` (`0% CPU`)** inside `ulTaskNotifyTake()`!
 
 5. **Second Button Press (or Bounce) Within `200 ms` at `t = 1050 ms`:**
    * `EXTI15_10_IRQHandler` notifies `vButtonServiceTask` (Prio 2) -> `PendSV_Handler` runs `vButtonServiceTask`.
-   * `vButtonServiceTask` checks `(1050 - 1000) = 50 < 200` (**FALSE** -> ignored!) and goes right back to **`Blocked` (`0% CPU`)** inside `ulTaskNotifyTake()`.
+   * `vButtonServiceTask` checks `(1050 - 1000) >= 200`, or `50 >= 200` (**FALSE** -> ignored!), then waits again in `ulTaskNotifyTake()`.
 
 ```text
+Illustrative timeline: the button is serviced before LED runs at tick 1000.
+If LED runs first, it schedules one more 500-tick interval instead.
+No other interrupts or higher-priority work delay these example executions.
+
 Task State Timeline (t = 0 ms to 1050 ms):
 
 Time (ms) | vButtonServiceTask (Prio 2) | vLedPeriodicTask (Prio 1) | prvIdleTask (Prio 0)

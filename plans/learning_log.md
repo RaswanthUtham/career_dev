@@ -1991,3 +1991,208 @@ explicit limitation.
   Inversion).
 - **Limits:** teaching Markdown and tracker/index/log updates only; no learner
   implementation edits, builds, or hardware runs performed. Quizzes remain paused.
+
+## 2026-11-17: Approved Remaining-Lesson Repairs And W04-L24 Publication
+
+- **Scope/approval:** learner selected all of L20-L23 plus the four earlier
+  findings in current L17-L19. Specific minimal repairs were presented and
+  approved. Learner chose static/source review only and will compile the host
+  examples independently.
+- **Earlier findings:** L17 PRIMASK scope, L19 EXC_RETURN/PSP selection and the
+  both-sided notification mapping were already corrected. Restored L19's
+  runtime STKALIGN/basic-frame qualification and corrected register counting.
+- **Repairs:** L20 GPIO/EXTI count, APB divider arithmetic and helper
+  prerequisites; L21 failure-atomic acquire/quiescence, MISRA advisory scope,
+  reduced nesting and checks for both unwind variants; L22 reference/config,
+  Blocked/list/wakeup semantics, overrun and cooldown boundaries, timing and
+  symbol ownership; L23 valid payload length, DMA-before-publication contract,
+  observable errors/abort, pointer and generation-wrap constraints, bounded
+  scan complexity and failing host checks. Correct explanations and purposeful
+  excerpt/full-listing repetition were preserved.
+- **Evidence:** tutor inspected the current requested Markdown on Windows,
+  accessible CubeF4 V1.28.3 FreeRTOS V10.3.1 task/header/CM4F port source, Linux
+  coding-style cleanup guidance for the existing comparison, and official
+  FreeRTOS queue/semaphore/mutex/critical-section documentation. Local
+  `queue.c` and `portmacro.h` reads were sandbox-blocked; no alternate-path
+  access was attempted. Exact API guidance is linked in the new lesson.
+- **Publication:** created
+  [W04-L24](../notes/lessons/W04_L24_freertos_synchronization_and_priority_inversion.md)
+  with mechanism selection, both-sided queue/semaphore handoffs, task-only
+  mutex ownership, H/M/L inversion/inheritance timelines, critical-section
+  limits and planned acceptance evidence. Updated the index/tracker and the
+  stale setup link to current L17.
+- **Limits/next:** expected C02/C03 results are predictions from static traces,
+  not test passes. No C compilation/execution, firmware changes, installation,
+  flash, board measurements or study-hour/mastery claims. Read L24 and discuss
+  requested clarifications; the next planned applied-C topic is C04 stop/drain.
+  Quizzes remain paused.
+- **Document validation:** tutor ran `git diff --check` and an inline Node
+  read-only document checker on Windows. Nine current documents, 97 local
+  links, Markdown fences, selected old-error patterns and the unchanged
+  historical log prefix passed. These checks do not compile or execute the C
+  examples; expected host results remain unverified.
+
+## 2026-11-17: Requested I2C/SPI, Debugging, Resistors, Interrupts And DMA Lesson
+
+- **Request:** explain both protocols, failed-communication debugging,
+  resistor purposes, GPIO/interrupt configuration and DMA use.
+- **Tutor action:** published
+  [W04-L25](../notes/lessons/W04_L25_i2c_spi_debug_interrupts_and_dma.md);
+  linked it from the index/tracker without rewriting existing lessons or
+  changing the primary F446RE/FreeRTOS P1 plan.
+- **Sources inspected:** NXP UM10204 Rev 7.0, local STM32F446 RM0390 Rev 6
+  and DS10693 Rev 10, existing GPIO alternate-function definitions and public
+  ST HAL SPI/I2C source. The current baseline lacks I2C/SPI HAL source modules;
+  public branch inspection is reference evidence, not an installed dependency.
+- **Teaching trace:** synthetic device address `0x48`, register `0x10`, data
+  `0x12/0x34`; separate synthetic SPI command `0x90`. Explained open-drain
+  pull-ups versus SPI bias/series resistors, CPOL/CPHA, peripheral versus EXTI
+  interrupts, DMA mappings and the distinction between DMA completion,
+  protocol completion and buffer quiescence. Future tests include errors,
+  timeout/cancellation and queue/buffer exhaustion.
+- **Limits/next:** document and illustrative arithmetic evidence only.
+  No firmware changes, build/run, peripheral wiring, board operations,
+  installations, physical measurements or learner-mastery claims.
+  Read the requested reference and discuss follow-ups; select/verify a target
+  and electrical contract before any runnable driver exercise. Quizzes remain
+  paused; study hours unknown.
+- **Document validation:** tutor's read-only Node checks passed seven local
+  lesson links, publication links, Markdown fences/table columns/whitespace,
+  I2C address encoding, clock counts and pull-up arithmetic. Targeted
+  `git diff --check` passed for index/tracker/log changes. These are document
+  checks, not compiled examples or electrical test results.
+
+## 2026-11-17: Rewrote W04-L25 Scenes 5–10 With DMA Foundation, 4 Interrupt Paths, And Direct CMSIS Register Code For SPI1 And ADC1 (With vs. Without DMA)
+
+- **Request:** rewrite everything from `## Scene 5` onward in
+  [W04-L25](../notes/lessons/W04_L25_i2c_spi_debug_interrupts_and_dma.md):
+  establish a clear `DMA` foundation first, explain the separate interrupt
+  paths, explain when interrupts trigger for `SPI` with vs. without DMA and how
+  DMA offloads the CPU, explain `ADC` and its interrupt paths with vs. without
+  DMA, and use simple hardware-bit explanations with direct CMSIS register code
+  (no STM32 HAL wrappers).
+- **Updates applied (`Scenes 5–10` of `W04-L25`):**
+  1. **Scene 5 (`DMA` Foundation):** Explained `DMA1` (`APB1`) vs. `DMA2` (the
+     only DMA wired to `APB2` peripherals `SPI1` & `ADC1` on `STM32F446`),
+     Streams (`0..7`), Channels (`CHSEL[2:0]`), and the 5 core stream registers
+     (`CR`, `NDTR` counting items, `PAR`, `M0AR`, and `LISR`/`LIFCR` `W1C`).
+  2. **Scene 6 (4 Separate Interrupt Paths):** Separated `GPIO -> SYSCFG -> EXTI`,
+     `SPI1`/`I2C1` peripheral IRQs, `ADC1` (`ADC_IRQn = 18`), and `DMAx_StreamY`
+     IRQs into a clear STM32-Peripheral-to-Arm-Core diagram.
+  3. **Scene 7 (`SPI1` Without DMA vs. With DMA):** Contrasted per-byte
+     `SPI1_IRQHandler` (`RXNE`/`TXE`/`OVR`, `64+` ISRs per `64` bytes) against
+     `DMA2_Stream2` RX + `DMA2_Stream3` TX (`RXDMAEN`/`TXDMAEN`, `0` per-byte
+     ISRs and `1` `TCIF2` ISR after all `64` RX bytes land in SRAM, followed by
+     bounded `TXE == 1 && BSY == 0` check before raising `CS`), with direct
+     `stm32f446xx.h` register code.
+  4. **Scene 8 (`ADC1` Without DMA vs. With DMA):** Covered `MODER = 0b11`
+     analog pin setup, `ADCPRE = /4` (`21 MHz <= 36 MHz`), `SMPR2`, `ADC1->SR`
+     (`rc_w0` write-`0`-to-clear vs. `DMA` `w1c`), single-register `ADC1->DR`
+     overrun risk in multi-channel scan without DMA (`EOCS = 1` firing after
+     every channel), and 2-channel `SCAN = 1` + `DMA = 1` + `DDS = 1` via
+     `DMA2_Stream0` Ch `0` firing once per full scan (`TCIF0`), with direct
+     `stm32f446xx.h` register code.
+  5. **Scenes 9–10, Recap & Interview Q&As:** Preserved `I2C1` `DMAEN`/`LAST`/`BTF`
+     rules, outside-in hardware debug checklist, and FreeRTOS buffer-quiescence
+     rules without HAL dependencies.
+- **Limits:** teaching Markdown and index/tracker/log updates only; no project
+  edits, builds, wiring, or target runs performed.
+
+## 2026-11-17: Restructured W04-L25 (Rev 3) With Simple ADC/DMA Foundations And Continuous 6-Byte 4-Mode Use-Case Scenarios
+
+- **Request:** give a simple visual idea of `ADC` and `DMA` alongside `I2C` and
+  `SPI` first, then walk continuous `6`-byte use-case scenarios (`0xAA..0xFF`
+  for `SPI1` and `I2C1`, and `ADC1` channels) starting from `84 MHz` system
+  clock + `GPIO` + peripheral setup through **CPU Polling $\rightarrow$ CPU
+  Interrupt $\rightarrow$ DMA Polling $\rightarrow$ DMA Interrupt**.
+- **Updates applied ([W04-L25](../notes/lessons/W04_L25_i2c_spi_debug_interrupts_and_dma.md)):**
+  1. **Part I (`Scenes 1–4`):** Unified plain-MCU foundations for `I2C`
+     (`SCL`/`SDA` open-drain + pull-ups), `SPI` (`SCK`/`MOSI`/`MISO`/`CS`
+     full-duplex shift circle + `CPOL`/`CPHA`), `ADC` (16:1 MUX $\rightarrow$
+     Sample-and-Hold `C_ADC` $\rightarrow$ `12-bit` SAR $\rightarrow$ single
+     `ADC1->DR` bottleneck, converting `{1.650 V, 0.825 V, 2.475 V}` to
+     `{0x0800, 0x0400, 0x0C00}`), and `DMA` (`DMA1` vs. `DMA2`, Streams/Channels,
+     5 core registers, and the 4 separate STM32-to-Arm interrupt paths).
+  2. **Part II (`Scenes 5–9`, all direct `stm32f446xx.h` CMSIS registers, zero HAL):**
+     - `Scene 5`: Shared `system_clock_84mhz_init()` (`SYSCLK = 84 MHz`,
+       `APB1 = 42 MHz`, `APB2 = 84 MHz`, `FLASH LATENCY = 2`).
+     - `Scene 6` (`SPI1` exchanging `{0xAA..0xFF}`): `GPIOA`/`SPI1` init
+       followed by CPU Polling, CPU Interrupt (`IRQ 35`), DMA Polling
+       (`DMA2_Stream2`/`Stream3`, `TCIE = 0`), and DMA Interrupt (`IRQ 58`,
+       `TCIE = 1`).
+     - `Scene 7` (`I2C1` writing `{0xAA..0xFF}` to target `0x48`, reg `0x10`):
+       `GPIOB`/`I2C1` `100 kHz` init followed by CPU Polling, CPU Interrupt
+       (`IRQ 31/32` with `ITBUFEN` clear on last byte), DMA Polling
+       (`DMA1_Stream6` Ch `1`, `TCIE = 0`), and non-blocking DMA Interrupt
+       (`IRQ 17` + `BTF` on `IRQ 31`).
+     - `Scene 8` (`ADC1` sampling `PA0/PA1/PB0` into `3 x 16-bit = 6 bytes`
+       `{0x0800, 0x0400, 0x0C00}`): Analog `GPIO`/`ADCCLK = 21 MHz` init
+       followed by CPU Polling (`1` channel per trigger), CPU Interrupt
+       (`SCAN + EOCS = 1` on `IRQ 18`), DMA Polling (`DMA2_Stream0` Ch `0`,
+       `TCIE = 0`), and DMA Interrupt (`IRQ 56`, `TCIE = 1`).
+     - `Scene 9`: 3-part FreeRTOS control-flow trace, outside-in debug table,
+       and DMA timeout/quiescence rules.
+- **Limits:** teaching Markdown and index/tracker/log updates only; no project
+  edits, compilation, flashing, wiring, or measurements performed.
+
+## 2026-11-17: Added Complete `Where:` Formula And Register-Notation Definitions Across W04-L25 (Rev 4)
+
+- **Request:** explain `V_pullup`, `V_OLmax`, `I_OL`, and all other formula
+  symbols, register acronyms, and bit notations across
+  [W04-L25](../notes/lessons/W04_L25_i2c_spi_debug_interrupts_and_dma.md) using
+  explicit `Where:` breakdowns.
+- **Updates applied:** audited all 9 scenes of `W04-L25` and added `Where:`
+  blocks defining every electrical formula parameter (`R_pull`, `R_min`,
+  `R_max`, `V_pullup`, `V_OLmax`, `I_OL`, `t_r_max`, `C_bus`, `0.8473`), bus
+  signal (`MOSI`/`MISO`/`SCK`/`CS_n`/`CPOL`/`CPHA`/`BSY`, `MSB`/`R/W_bit`),
+  `ADC` conversion parameter (`MUX`, `V_pin`, `VSSA`, `VREF+`, `C_ADC`,
+  `R_source`, `ADCCLK`, `SMP`, `t_conv`, `OVR`), `DMA` stream/flag register
+  (`PAR`, `M0AR`, `NDTR`, `CR`, `LISR`/`HISR`, `LIFCR`/`HIFCR`, `TCIF`..`FEIF`),
+  `84 MHz` clock/flash formula (`HSI`, `PLLM`/`PLLN`/`PLLP`/`PLLQ`, `VOS`,
+  `LATENCY`), peripheral register fields (`SPI1`, `I2C1` `CCR`/`TRISE`, `ADC1`
+  `SMPR2`/`SQR1`/`SQR3`), and `PSP`/`MSP`/FreeRTOS notification primitives.
+- **Limits:** teaching Markdown and log updates only.
+
+## 2026-11-17: Rewrote W04-L24 (Rev 2) With Simple Continuous P1 Example, Internal `Queue_t` Comparison, And Complete `p1_sync_demo.c`
+
+- **Request:** update
+  [W04-L24](../notes/lessons/W04_L24_freertos_synchronization_and_priority_inversion.md)
+  with clear, simple explanations and a continuous concrete example to make the
+  core FreeRTOS synchronization concepts easy to understand.
+- **Updates applied:**
+  1. Unified the entire lesson around one continuous `P1` setup (`EXTI15_10`
+     `ISR` at `NVIC` priority `5` + `Task H=3`, `Task M=2`, `Task L=1`).
+  2. Added Scene 1 comparing how FreeRTOS builds **Queue**, **Binary Semaphore**,
+     **Counting Semaphore**, and **Mutex** on `Queue_t` (item size, initial
+     count `0` vs. `1`, `pxMutexHolder` ownership, and `ISR` legality) plus a
+     5-second selection table.
+  3. Rewrote Scenes 2–6 (`Queue`, `Binary Semaphore`, `Mutex`, `t = 0..8 ms`
+     Priority Inversion vs. Priority Inheritance trace, and `BASEPRI = 0x50`
+     `taskENTER_CRITICAL` snapshot) with `BEFORE -> AFTER` boxes, `Where:`
+     definitions, and focused snippets, followed by a complete `p1_sync_demo.c`
+     module with `C02` reverse-order startup unwind in Scene 7.
+- **Limits:** teaching Markdown and log updates only; no project edits, builds,
+  or target execution performed.
+
+## 2026-11-18: Refined W04-L25 (Rev 5) — Generic Cross-MCU DMA (`Stream` vs. `Channel`), Step-By-Step Interrupt Paths, And Concise Production Register Code
+
+- **Request:** keep `Scenes 1–3` of
+  [W04-L25](../notes/lessons/W04_L25_i2c_spi_debug_interrupts_and_dma.md)
+  intact; rewrite `Scene 4` onward to explain generic cross-MCU `DMA` (`STM32` /
+  `AURIX` / `RISC-V`) and `Stream` vs. `Channel` with a simple scenario, trace
+  the step-by-step interrupt paths (`Pin/SYSCFG/EXTI`, `SPI/I2C`, `ADC`, `DMA`
+  $\rightarrow$ `NVIC` $\rightarrow$ `CPU`), fold symbol explanations inline
+  instead of trailing `Where:` blocks, remove redundant clock/boilerplate code,
+  and pair generic pseudocode with concise production-style `STM32F446RE`
+  register code across Polling, Interrupt, DMA Polling, and DMA Interrupt for
+  `SPI1`, `I2C1`, and `ADC1`.
+- **Clarification confirmed via `ask_user`:** keep `Scenes 1–3` untouched;
+  order as `Generic DMA & Stream vs. Channel -> Step-by-step Interrupt Paths ->
+  4-mode SPI / I2C / ADC`; use generic pseudocode during concept explanation
+  plus straightforward production-style `STM32F446RE` register code with inline
+  bit comments.
+- **Updates applied:** updated `Scenes 4–9` of `W04-L25` (reducing total file
+  length from `1,485` lines to `~785` focused lines while keeping `Scenes 1–3`
+  untouched) and updated `notes/lessons/README.md`.
+- **Limits:** teaching Markdown, index, and log updates only; no project source
+  changes, builds, or hardware runs performed.

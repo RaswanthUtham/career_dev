@@ -11,6 +11,18 @@ Updated 2026-11-17; MCU/FreeRTOS-first pivot approved on 2026-10-26.
   target. No extra time or mastery inferred from changing the plan.
 - Active focus: MCU driver ownership, C01 runtime evidence and board/toolchain
   readiness before FreeRTOS integration.
+- Requested peripheral & DMA reference
+  [W04-L25](../notes/lessons/W04_L25_i2c_spi_debug_interrupts_and_dma.md)
+  **Published & revised (rev 3)**, 2026-11-17: Part I (`Scenes 1–4`) covers
+  simple foundations for `I2C`, `SPI`, `ADC`, `DMA`, and 4 separate interrupt
+  paths; Part II (`Scenes 5–9`) traces continuous `6`-byte scenarios
+  (`{0xAA..0xFF}` on `SPI1` and `I2C1`, and `3 x 16-bit = 6 bytes` on `ADC1`)
+  from `84 MHz` clock + `GPIO` + peripheral init through CPU Polling, CPU
+  Interrupt, DMA Polling, and DMA Interrupt in direct CMSIS register code
+  (zero HAL), plus outside-in debugging and DMA buffer quiescence.
+  Document/source-reviewed synthetic examples only; target selection, wiring,
+  implementation and physical tests remain pending. Publication does not mark
+  the P1 driver milestones complete.
 - Optional Pico setup, 2026-11-07: learner reports `RPI-RP2` USB bootloader
   detection and extension installation. Tutor's second read-only VS Code CLI
   inventory confirms official Pico extension 0.23.0. Learner subsequently
@@ -25,7 +37,7 @@ Updated 2026-11-17; MCU/FreeRTOS-first pivot approved on 2026-10-26.
   **F767ZI/Zephyr P2**. Pico remains a bounded setup check and a later optional
   producer/consumer multicore experiment, replacing another Week 17 extension
   only if the P1/P2 cores are sound. No third project or extra weekly hours.
-- Current topics 10–15 **In progress / Published** (re-ordered 2026-11-01 so
+- Current topics 10–19 **Published / learner evidence pending where unstated** (re-ordered 2026-11-01 so
   Arm Cortex-M4 instructions and registers come first):
   - Topic 10 ([W01-L15](../notes/lessons/W01_L15_thumb_and_arm_instruction_sets.md)):
     Thumb (`T32` / `Thumb-2`), `A32`, `A64`, instruction width vs. register
@@ -62,6 +74,15 @@ Updated 2026-11-17; MCU/FreeRTOS-first pivot approved on 2026-10-26.
     why `volatile` does not prevent torn multi-word reads, bounded copy-by-value
     queues, and zero-copy `FREE -> FILLING -> READY -> IN_USE -> FREE` slot
     pools with generation-guarded release (`P1`).
+  - Topic 19 ([W04-L24](../notes/lessons/W04_L24_freertos_synchronization_and_priority_inversion.md)):
+    Queue versus notification/binary semaphore versus mutex, task/ISR rules,
+    short critical sections, and an illustrative H/M/L priority-inversion and
+    inheritance trace. Source/API-reviewed publication; runtime trace planned.
+  - Approved review repairs, 2026-11-17: L19 frame alignment, L20 GPIO/clock
+    facts, L21 acquire/quiescence/MISRA/test contracts, L22 scheduling and
+    integration semantics, L23 payload/pool/error/test contracts. Three other
+    earlier L17-L19 findings were already fixed. Learner selected static/source
+    review only; C02/C03 harness compilation/execution remains pending.
   Proposed `RegistersDebug` configuration preserves the existing HAL source.
   References are document/source-reviewed only, not compiled/flashed. Topic 9
   ([W01-L14](../notes/lessons/W01_L14_b1_button_polling_and_nonblocking_debounce.md))
@@ -135,7 +156,7 @@ proof. Tutor publication is not learner completion.
 | Pico setup / UF2 | In progress | BOOTSEL detection, project creation and UF2 availability learner-reported; extension 0.23.0 inspected; artifact/configuration and physical run unverified |
 | Pico SWD debug | Planned | SWCLK/SWDIO/GND identified by learner; compatible probe, pinout, signaling/power and host tools require verification |
 | Optional Pico multicore | Deferred | P1/P2 and single-core FreeRTOS gates first; one bounded experiment may replace another Week 17 option |
-| FreeRTOS | Planned | Select/pin official kernel, Cortex-M port, build/heap/config; source not added or built |
+| FreeRTOS | Planned | Local CubeF4 V1.28.3 V10.3.1 task/CM4F reference inspected; P1 build/heap/config integration and runtime not established |
 | Zephyr | Planned | Existing reference checkout; release/modules/SDK/runtime not validated for P2 |
 | Saleae | Blocked | Model/probe limits/sample rate unresolved |
 | Windows primary host | In progress | Build/debug completed-reported; ELF/map and launch metadata inspected, no tutor target access or detailed runtime record |
@@ -144,7 +165,7 @@ proof. Tutor publication is not learner completion.
 | First ST-LINK session | Completed-reported | Learner says done/debugged; saved launch selects Debug ELF and main breakpoint; no console/state capture supplied |
 | Initialization checkpoints | Completed-reported | Learner says observed values: software clock 84 MHz after setup and 1 ms tick progression; measurement method/raw capture not supplied |
 | First LD2 output | Planned | L12: learner types four calls, builds and observes onboard LED; no tutor compile/run requested |
-| Register-level EXTI layer | Planned | Approved L15 reference; local RM0390 Rev6, UM1724 Rev14 and DUI0553B checked; separate config/build/silicon-errata/board checks pending |
+| Register-level EXTI layer | Planned | Approved current L17 reference (formerly L15); local RM0390 Rev6, UM1724 Rev14 and DUI0553B checked; separate config/build/silicon-errata/board checks pending |
 | Ubuntu HP alternative | Installed-reported | Ubuntu Server installed per learner; exact release/SSH/tools/free space unverified; not a prerequisite |
 | Existing Podman | Optional host-C reference | Prior host/compiler evidence retained; no requirement to use it for Windows board builds |
 | P1 core | Planned | Requirements, model, cyclic driver and fault-recording evidence |

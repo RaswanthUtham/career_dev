@@ -262,7 +262,7 @@ Board Schematic (B1 on PC13) -> STM32 Peripherals (GPIOC -> SYSCFG -> EXTI13) ->
    * **Register / Bit:** `Set RCC->AHB1ENR bit 2 = 1; clear GPIOC->MODER bits [27:26] = 0b00; set GPIOC->PUPDR bits [27:26] = 0b01.`
 
 2. **Enable the `SYSCFG` peripheral clock (`RCC->APB2ENR` bit `14`) and route `EXTI` line `13` to Port C (`SYSCFG->EXTICR[3]` bits `[7:4] = 0b0010`).**
-   * **Otherwise:** `GPIOC` cannot interrupt the Arm CPU directly—all 16 GPIO ports share `16` `EXTI` lines through the `SYSCFG` multiplexer, which defaults to Port A (`PA13`) at reset. And if `RCC->APB2ENR` bit `14` (`SYSCFGEN`) is `0`, writes to `SYSCFG->EXTICR[3]` are ignored!
+   * **Otherwise:** `GPIOC` cannot interrupt the Arm CPU directly—same-numbered pins across GPIO ports share one of the `16` GPIO `EXTI` lines through the `SYSCFG` multiplexer, which selects Port A (`PA13` for line 13) at reset. And if `RCC->APB2ENR` bit `14` (`SYSCFGEN`) is `0`, writes to `SYSCFG->EXTICR[3]` are ignored!
    * **Register / Bit:** `Set RCC->APB2ENR bit 14 = 1 (SYSCFGEN); set SYSCFG->EXTICR[3] bits [7:4] = 0b0010 (Port C -> EXTI13).`
 
 3. **Configure the `EXTI` edge detector (`EXTI->FTSR` / `RTSR` bit `13`), clear stale pending flags (`EXTI->PR = 1UL << 13`), and unmask `EXTI->IMR` bit `13`.**
@@ -275,10 +275,18 @@ Board Schematic (B1 on PC13) -> STM32 Peripherals (GPIOC -> SYSCFG -> EXTI13) ->
 
 ### Code for Scene 4: BSP Button Interrupt Initialization (`bsp_b1_exti_init`)
 
+**Caller contract:** Run once during privileged startup, with IRQ 40 inactive
+and its shared lines coordinated. Install `EXTI15_10_IRQHandler` and its data
+before this helper can enable it. The handler must clear the serviced EXTI
+sources. Set `PRIGROUP = 3` for the stated four-bit preemption priority and
+choose when global masks permit delivery; when using FreeRTOS, enable delivery
+only when the kernel and receiving task are ready. This helper configures
+routing, not the handler or a debounce algorithm.
+
 ```c
 #include "stm32f446xx.h"
 
-/* Complete BSP helper routing NUCLEO-F446RE B1 (PC13) -> SYSCFG -> EXTI13 -> NVIC IRQ 40: */
+/* BSP routing helper; the caller provides the handler and startup contract above. */
 static inline void bsp_b1_exti_init(void)
 {
     NVIC->ICER[1] = (1UL << 8);                          /* 1. Mask IRQ 40 during setup */
@@ -331,7 +339,7 @@ RTOS: scheduling and synchronization, integrated with this platform
 ### Step-by-Step Explanation: What Each Software Layer Owns
 
 1. **Use `CMSIS` (`core_cm4.h` + `stm32f446xx.h`) to access standard Arm Cortex-M4 registers (`SCB`, `NVIC`, `SysTick`, `MPU`) and STM32 peripheral structs (`RCC`, `GPIOA`, `EXTI`).**
-   * **Otherwise:** Without `CMSIS`, every file must redeclare raw hex addresses and inline assembly intrinsics by hand. (`CMSIS` is a register/core interface, not a board support package.)
+   * **Otherwise:** Without `CMSIS`, you must maintain equivalent register definitions and core helpers, normally in shared headers. (`CMSIS` is a register/core interface, not a board support package.)
    * **Header / Symbol:** `#include "stm32f446xx.h" -> provides GPIOA->BSRR, RCC->AHB1ENR, NVIC->ISER, __disable_irq().`
 
 2. **Use `HAL` / `LL` (`stm32f4xx_hal_gpio.c`) when you want reusable MCU peripheral APIs, and `BSP` (`stm32f4xx_nucleo.c`) when you want to map board names (`LED2`, `BUTTON_USER`) to specific MCU pins (`PA5`, `PC13`).**
@@ -386,8 +394,8 @@ Symptom: UART terminal shows unreadable characters
 ```
 
 1. **Verify the active system clock (`RCC->CFGR` bits `[3:2]` `SWS`) and `APB1` peripheral clock divider (`RCC->CFGR` bits `[12:10]` `PPRE1`) that feeds `USART2`.**
-   * **Otherwise:** `USART2` sits on `APB1`. If software calculates `USART2->BRR` assuming `APB1 = 42 MHz` (`SYSCLK = 84 MHz`, `PPRE1 = /2`), but the CPU is still running on `16 MHz HSI` (`SWS = 0b00`), the actual baud rate is off by `42 / 16 = 2.625x` and the terminal prints garbage!
-   * **Register / Bit:** `Check (RCC->CFGR & (3UL << 2)) == (2UL << 2) (PLL active) and (RCC->CFGR & (7UL << 10)) == (4UL << 10) (APB1 = HCLK / 2 = 42 MHz).`
+   * **Otherwise:** `USART2` sits on `APB1`. Suppose software calculates `USART2->BRR` for `APB1 = 42 MHz` (`SYSCLK = 84 MHz`, `HPRE = /1`, `PPRE1 = /2`). If the source is still `16 MHz HSI` (`SWS = 0b00`) with those same dividers, `APB1 = 8 MHz`. With the same `BRR` and oversampling setting, baud scales by `8 / 42`: it is `5.25x` slower than the 42 MHz case. With reset dividers `/1`, APB1 would instead be `16 MHz`; source and dividers must be checked together.
+   * **Register / Bit:** `Check (RCC->CFGR & (3UL << 2)) == (2UL << 2) (PLL active), (RCC->CFGR & (15UL << 4)) == 0U (HCLK = SYSCLK), and (RCC->CFGR & (7UL << 10)) == (4UL << 10) (APB1 = HCLK / 2 = 42 MHz).`
 
 2. **Verify that `PA2` (`USART2_TX`) and `PA3` (`USART2_RX`) are configured for Alternate Function mode (`GPIOA->MODER` = `0b10`) and mapped to `AF7` (`GPIOA->AFR[0]` = `7`).**
    * **Otherwise:** Leaving `PA2`/`PA3` in Input (`0b00`) or GPIO Output (`0b01`) mode, or selecting the wrong alternate function number in `GPIOA->AFR[0]` (Datasheet Table 11 shows `USART2` is `AF7`), leaves the `USART2` peripheral disconnected from the ST-LINK Virtual COM Port pins (`PA2`/`PA3` per `UM1724` Sec 6.8).
@@ -494,5 +502,6 @@ memory ownership and debugging matter more than memorizing API names.
 
 ## Corrections
 
+- 2026-11-17: Approved source-only repair: GPIO/EXTI mux count, clock-divider arithmetic and BSP helper prerequisites. Examples remain unbuilt.
 - Initial publication, 2026-10-29.
 - 2026-10-29: Updated Scenes 1–6 with step-by-step `"What & Why -> Otherwise... -> Register / Bit"` explanations, STM32-peripheral-to-Arm-core interrupt routing (`bsp_b1_exti_init`), and corresponding C code snippets per learner request.

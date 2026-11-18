@@ -58,7 +58,7 @@ existing roadmap budget, not a third full project.
 
 ### Register-Level Lesson And Local Manuals (2026-10-28)
 
-Learner approved the [L15 register-level exercise](../notes/lessons/W01_L15_b1_exti_interrupt_handoff_and_debounce.md):
+Learner approved the [L17 register-level exercise](../notes/lessons/W01_L17_b1_exti_interrupt_handoff_and_debounce.md) (formerly L15):
 retain 84 MHz but teach power, Flash timing, PLL/dividers, SysTick and
 GPIO/EXTI/NVIC directly, without HAL calls in the exercise. CMSIS register names,
 intrinsics and device startup/linker support remain. Use a separate proposed

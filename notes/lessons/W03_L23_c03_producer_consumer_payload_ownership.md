@@ -1,6 +1,6 @@
 # W03-L23: Event Producer/Consumer Ownership Model (`C03`) — Payload Lifetime, Torn Reads, Copy Queues, And Zero-Copy Slot Pools (`P1`)
 
-> **Scope & verification status:** `Source-reviewed C03 architecture & embedded C ownership lesson (2026-11-17): covers ISO C object lifetime, Cortex-M4 ISR-to-task shared-memory hazards, FreeRTOS copy-queue vs. zero-copy pool handoff on STM32F446RE (P1), and AUTOSAR/MISRA static pool contracts.`
+> **Scope & verification status:** Source-reviewed C03 lesson, repaired with approval on 2026-11-17. The standalone C11 pool model is sequential; its critical-section hooks are no-ops. FreeRTOS/ISR/DMA snippets are interface illustrations. The learner selected source review only: no compilation, execution, target synchronization or timing result is claimed.
 
 Previous: [FreeRTOS from the ground up — task states, TCB & lists, priorities, `vTaskDelayUntil`, and ISR task notifications (`P1`)](W03_L22_freertos_tasks_states_delays_and_notifications.md).
 
@@ -14,13 +14,13 @@ Now look at our real `P1` fault recorder and sensor service on `STM32F446RE`:
 * When an interrupt or cyclic acquisition completes, the **Producer** (an ISR, DMA callback, or acquisition task) must hand a **multi-byte payload** (for example, a 16-byte fault record or a 64-byte SPI/ADC sample block) to a **Consumer** (the diagnostic/recorder task).
 * A notification (`vTaskNotifyGiveFromISR`) **only wakes the consumer**—it does **not** protect the payload bytes in RAM!
 
-To pass a multi-byte payload from a Producer to a Consumer without corrupting RAM, every Staff/Principal embedded engineer uses one of **two explicit ownership models**:
+Two useful ownership models for our P1 handoff are:
 
 1. **Model A — Copy-By-Value Queue (For Small Payloads, e.g., `4` to `32` Bytes):**
    * The Producer fills a local struct, and the queue (`xQueueSendFromISR`) **copies all bytes** into the queue's own internal slot array while interrupts are masked.
    * **Ownership rule:** The Producer owns its local struct; the Queue owns the queued copy; the Consumer copies the bytes out into its own local struct (`xQueueReceive`). They never share the same buffer in RAM.
 2. **Model B — Zero-Copy Static Slot Pool (`FREE -> FILLING -> READY -> IN_USE -> FREE`, For Larger Payloads `64+` Bytes):**
-   * Copying `256 bytes` inside an ISR or critical section keeps `BASEPRI` masked too long and adds interrupt jitter.
+   * Copying `256 bytes` inside a critical section increases interrupt-masking time. Whether that exceeds the budget depends on the target, compiler and measured workload; these sizes are examples, not universal cutoffs.
    * Instead, we pre-allocate a static array of `N` fixed-size buffers (**slots**) in SRAM.
    * The Producer claims one `FREE` slot (`FILLING`), writes the `256` bytes **outside** any critical section, and then hands off **only the 1-byte/4-byte `slot_id`** (`READY`) to the Consumer.
    * **Ownership rule:** At every microsecond, **at most ONE actor (Pool, Producer, Queue, or Consumer) is allowed to touch a given slot**. Once the Producer publishes `slot_id` (`READY`), the Producer **loses permission to touch that slot** until the Consumer finishes reading (`IN_USE`) and explicitly returns it to `FREE`!
@@ -46,7 +46,7 @@ Before building the two clean solutions, understand the **three exact bugs** tha
 ### Bug 1 — Dangling Stack Pointer (Object Lifetime Ended Before Consumer Ran)
 * A Producer task creates a local struct on its stack (`p1_frame_t frame;`), pushes the **pointer `&frame`** into a queue, and exits the function (or loops to the next iteration).
 * By the time the Consumer task wakes up and dereferences that pointer, the Producer's stack frame has already been overwritten by another function call!
-* **C Lifetime Rule:** A local non-`static` variable's lifetime ends the instant execution leaves its `{ ... }` block. Never hand a pointer to stack memory to an asynchronous consumer or ISR/DMA!
+* **C Lifetime Rule:** An automatic local object's lifetime ends when execution leaves its block. An asynchronous borrow is valid only if the object stays alive and unchanged until the borrower finishes. A loop may also reuse a still-live object too early; both lifetime and reuse must be controlled.
 
 ### Bug 2 — Torn Read on a Single Global Struct (`volatile` Does NOT Fix This!)
 * An engineer declares one global struct `volatile p1_frame_t g_frame;` in SRAM.
@@ -103,8 +103,17 @@ When each event is small (such as our 12-byte `p1_fault_frame_t`), **copying the
    * **Pointer checks:** Rejects `NULL` pointers (`q == NULL` or `frame == NULL`) cleanly with `false`.
    * **Overload policy (`count == CAP`):** An ISR or bounded cyclic producer **cannot sleep** when the queue is full. We use an explicit **Drop-Newest** policy: reject the new item, leave the `4` already-queued items intact, and increment `q->dropped_count` so diagnostics know an overload occurred!
 2. **Why Lifetime Is Safe:**
-   * `q->items[q->head] = *in_frame;` copies all 12 bytes into the queue while interrupts are masked. The instant `copy_queue_push()` returns, the Producer owns `in_frame` again and can overwrite it or return from its function safely.
-   * `copy_queue_pop()` copies the 12 bytes out into `*out_frame` while interrupts are masked. The instant `copy_queue_pop()` returns, that queue slot is free and the Consumer owns its private `*out_frame` copy!
+   * `q->items[q->head] = *in_frame;` copies the value into independent queue storage. The Producer keeps ownership of its input and may reuse it after `copy_queue_push()` returns.
+   * `copy_queue_pop()` copies the value into `*out_frame`. After a successful pop, that queue slot is free and the Consumer owns its private copy.
+
+**Model boundary:** The functions below are sequential and contain no interrupt
+masking. For concurrent use, synchronize each entire operation, including
+capacity checks, copies, indexes and counters, against every participating
+context; masking only priorities `5..15` does not exclude an ISR at priority
+`0..4`. Prefer the real FreeRTOS queue APIs for the RTOS transfer.
+Initialize `q` to zero before use. Non-NULL pointers must address valid objects
+of the declared type; input/output objects must not overlap queue storage or
+metadata. A NULL check cannot validate a dangling pointer.
 
 ```text
 Copy-By-Value Queue (`CAP = 4`, `count` tracks `0..4` items):
@@ -187,6 +196,12 @@ Instead, we build a **Zero-Copy Slot Pool** where **only a tiny handle (`slot_id
 
 ### 2. Why Do We Include a `generation` Counter Inside the Handle?
 
+The generation is a finite 32-bit reuse counter, not a permanent identity.
+After `2^32` increments it repeats. The contract excludes a stale handle
+surviving that many reuses (or a pool reset); a stronger session/retirement
+policy is needed otherwise. Raw payload pointers are borrowed views: a
+generation check cannot revoke a pointer already retained by buggy code.
+
 Suppose a buggy Consumer accidentally calls `slot_pool_release(pool, handle)` **twice** with the same `handle`:
 * On the 1st release, Slot `0` returns to `SLOT_FREE`, **increments `slot->generation` (`1 -> 2`)**, and gets allocated to a new ISR event (`SLOT_FILLING`, `generation = 2`).
 * On the 2nd (buggy) release, the Consumer passes its old `handle` (`slot_id = 0, generation = 1`).
@@ -240,7 +255,8 @@ Look at how cleanly Model B maps onto FreeRTOS on our `NUCLEO-F446RE` (`P1`):
    xReadyQueue = xQueueCreate(P1_POOL_SLOTS, sizeof(slot_handle_t));
    ```
 2. **Inside the Producer ISR (`DMA` / `SPI` / `TIM` ISR at HW Priority `5..14`):**
-   * Claims a `SLOT_FREE` buffer (`SLOT_FILLING`), fills `payload[]` (or lets DMA fill `payload[]`), transitions that slot to `SLOT_READY`, and sends the 8-byte `slot_handle_t` with **`xQueueSendFromISR(xReadyQueue, &handle, &xHigherPriorityTaskWoken)`** + **`portYIELD_FROM_ISR(xHigherPriorityTaskWoken)`**!
+   * Claims a `SLOT_FREE` buffer (`SLOT_FILLING`), writes the valid payload bytes, transitions that slot to `SLOT_READY`, and sends the 8-byte `slot_handle_t` with **`xQueueSendFromISR(xReadyQueue, &handle, &xHigherPriorityTaskWoken)`** + **`portYIELD_FROM_ISR(xHigherPriorityTaskWoken)`**!
+   * For DMA, keep the slot `FILLING` until transfer completion is confirmed and the required memory-visibility rules are satisfied. Starting DMA does not make the payload ready. On cancellation, stop DMA and establish quiescence before returning the slot.
    * If `xQueueSendFromISR()` ever fails, the Producer unwinds that slot (`SLOT_READY -> SLOT_FREE`) so the slot is never leaked!
 3. **Inside the Consumer Task (`vDiagRecorderTask`):**
    * Sleeps at **`0% CPU` (`Blocked`)** inside **`xQueueReceive(xReadyQueue, &handle, portMAX_DELAY)`**.
@@ -255,14 +271,22 @@ Look at how cleanly Model B maps onto FreeRTOS on our `NUCLEO-F446RE` (`P1`):
  *   uint8_t *buf = NULL;
  *   slot_handle_t h;
  *   if (p1_pool_alloc_isr(&g_pool, &h, &buf)) {
- *       buf[0] = status_reg;               // Fill 64-byte buffer directly (zero copy)
- *       h.payload_len = 64U;
+ *       buf[0] = status_reg;               // Exactly one byte has been initialized
+ *       h.payload_len = 1U;                // Publish only that valid byte
  *       if (p1_pool_mark_ready_isr(&g_pool, &h)) {
  *           BaseType_t woken = pdFALSE;
  *           if (xQueueSendFromISR(xReadyQueue, &h, &woken) != pdPASS) {
- *               p1_pool_abort_ready_isr(&g_pool, h); // Never leak slot if queue full!
+ *               record_queue_full_isr();  // Bounded diagnostic, no blocking/printing
+ *               if (!p1_pool_abort_ready_isr(&g_pool, h)) {
+ *                   latch_pool_fault_isr(); // Stop new acquisition; retain bad slot
+ *               }
  *           }
  *           portYIELD_FROM_ISR(woken);
+ *       } else {
+ *           if (!p1_pool_abort_filling_isr(&g_pool, h)) {
+ *               latch_pool_fault_isr();
+ *           }
+ *           record_publish_error_isr();
  *       }
  *   }
  *
@@ -273,8 +297,12 @@ Look at how cleanly Model B maps onto FreeRTOS on our `NUCLEO-F446RE` (`P1`):
  *           const uint8_t *ro_data = NULL;
  *           uint16_t len = 0U;
  *           if (p1_pool_begin_consume(&g_pool, h, &ro_data, &len)) {
- *               process_p1_block(ro_data, len); // Read in place while ISRs use other slots!
- *               (void)p1_pool_end_consume(&g_pool, h); // Returns slot to SLOT_FREE
+ *               process_p1_block(ro_data, len); // Read only len initialized bytes
+ *               if (!p1_pool_end_consume(&g_pool, h)) {
+ *                   latch_pool_fault();  // Failed release needs recovery
+ *               }
+ *           } else {
+ *               latch_pool_fault();
  *           }
  *       }
  *   }
@@ -285,7 +313,23 @@ Look at how cleanly Model B maps onto FreeRTOS on our `NUCLEO-F446RE` (`P1`):
 
 ## Complete Standalone Runnable C03 Code (`c03_ownership_handoff_test.c`)
 
-You can compile and run this complete file on host (`gcc -std=c11 -Wall -Wextra -Werror c03_ownership_handoff_test.c -o c03_test`) to verify every single ownership transition, overload drop, and stale/double-release guard:
+This standalone host model checks a payload handoff, pool exhaustion, duplicate
+release, stale release after reuse, and abort after an oversized publication.
+Suggested learner command:
+`gcc -std=c11 -Wall -Wextra -Werror c03_ownership_handoff_test.c -o c03_test.exe`,
+then `.\c03_test.exe` in PowerShell. Expected: `C03 ownership checks: PASS`,
+exit status `0`; a failed check prints a failure and returns `1`.
+
+**Pool contract:** All objects are valid and initialized; output parameters
+point to separate writable objects outside the pool. Zero-length payloads are
+allowed; lengths greater than capacity fail. Publish failure keeps a valid
+slot `FILLING`, owned by its producer, who must retry or abort it.
+Initialize/reset only when no owner or callback retains a handle/pointer.
+Only the pool API mutates its metadata and ready queue. This invariant makes
+internally queued IDs/lengths valid; the queue is not an untrusted-input parser.
+The FreeRTOS illustration uses a separate queue and named synchronization/error
+helpers that must be implemented for the target; the following host code uses
+its own queue instead. Its no-op hooks do not establish ISR/DMA safety.
 
 ```c
 #include <stdbool.h>
@@ -331,16 +375,17 @@ typedef struct {
 static inline uint32_t crit_enter(void) { return 0U; }
 static inline void     crit_exit(uint32_t saved) { (void)saved; }
 
-void p1_bus_init(p1_zero_copy_bus_t *bus)
+bool p1_bus_init(p1_zero_copy_bus_t *bus)
 {
     if (bus == (p1_zero_copy_bus_t *)0) {
-        return;
+        return false;
     }
     *bus = (p1_zero_copy_bus_t){0};
     for (uint16_t i = 0U; i < P1_POOL_SLOTS; ++i) {
         bus->slots[i].state      = SLOT_FREE;
         bus->slots[i].generation = 1U; /* Non-zero starting generation */
     }
+    return true;
 }
 
 /* STAGE 1 (Producer): Claim one SLOT_FREE -> SLOT_FILLING and get writable buffer: */
@@ -413,6 +458,25 @@ bool p1_producer_publish(p1_zero_copy_bus_t *bus,
     return true;
 }
 
+/* Producer abort: return a still-owned FILLING slot after failed publication. */
+bool p1_producer_abort(p1_zero_copy_bus_t *bus, slot_handle_t handle)
+{
+    if ((bus == (p1_zero_copy_bus_t *)0) || (handle.slot_id >= P1_POOL_SLOTS)) {
+        return false;
+    }
+    uint32_t mask = crit_enter();
+    p1_slot_t *slot = &bus->slots[handle.slot_id];
+    if ((slot->state != SLOT_FILLING) || (slot->generation != handle.generation)) {
+        ++bus->invalid_state_errors;
+        crit_exit(mask);
+        return false;
+    }
+    ++slot->generation;
+    slot->state = SLOT_FREE;
+    crit_exit(mask);
+    return true;
+}
+
 /* STAGE 3 (Consumer): Pop ready handle and claim SLOT_READY -> SLOT_IN_USE: */
 bool p1_consumer_acquire(p1_zero_copy_bus_t *bus,
                          slot_handle_t *out_handle,
@@ -461,7 +525,7 @@ bool p1_consumer_acquire(p1_zero_copy_bus_t *bus,
 }
 
 /* STAGE 4 (Consumer): Return finished slot to pool (SLOT_IN_USE -> SLOT_FREE)
- * and bump generation so any stale copy of `handle` becomes invalid immediately: */
+ * and bump generation; old handles are invalid within the stated reuse window: */
 bool p1_consumer_release(p1_zero_copy_bus_t *bus, slot_handle_t handle)
 {
     if ((bus == (p1_zero_copy_bus_t *)0) || (handle.slot_id >= P1_POOL_SLOTS)) {
@@ -486,13 +550,17 @@ bool p1_consumer_release(p1_zero_copy_bus_t *bus, slot_handle_t handle)
 int main(void)
 {
     p1_zero_copy_bus_t bus;
-    p1_bus_init(&bus);
+    if (!p1_bus_init(&bus)) {
+        fprintf(stderr, "FAIL: pool init\n");
+        return 1;
+    }
 
     /* 1. Producer allocates Slot 0, writes "FAULT_01", and publishes it: */
     slot_handle_t p_h1;
     uint8_t      *wbuf1 = NULL;
     bool ok1 = p1_producer_alloc(&bus, &p_h1, &wbuf1);
     if (!ok1) {
+        fprintf(stderr, "FAIL: first allocation\n");
         return 1;
     }
     memcpy(wbuf1, "FAULT_01", 8U);
@@ -504,6 +572,7 @@ int main(void)
     uint16_t       rlen1 = 0U;
     bool acq1 = p1_consumer_acquire(&bus, &c_h1, &rbuf1, &rlen1);
     if (!acq1) {
+        fprintf(stderr, "FAIL: first acquisition\n");
         return 1;
     }
 
@@ -514,6 +583,7 @@ int main(void)
     uint8_t      *wbuf2 = NULL, *wbuf3 = NULL;
     bool ok2 = p1_producer_alloc(&bus, &p_h2, &wbuf2);
     if (!ok2) {
+        fprintf(stderr, "FAIL: second allocation\n");
         return 1;
     }
     memcpy(wbuf2, "FAULT_02", 8U);
@@ -521,19 +591,70 @@ int main(void)
     bool ok3  = p1_producer_alloc(&bus, &p_h3, &wbuf3); /* Expected: false (drop!) */
 
     /* Verify Consumer's Slot 0 data ("FAULT_01") was NEVER overwritten by Burst A/B: */
-    bool slot0_intact = (memcmp(rbuf1, "FAULT_01", 8U) == 0);
+    bool slot0_intact = (rlen1 == 8U) && (memcmp(rbuf1, "FAULT_01", 8U) == 0);
 
     /* 4. Consumer releases Slot 0 once (OK), then tries a buggy double-release (Rejected!): */
     bool rel1_ok        = p1_consumer_release(&bus, c_h1);
     bool rel1_duplicate = p1_consumer_release(&bus, c_h1); /* Expected: false! */
 
-    printf("ok1=%d pub1=%d acq1=%d | ok2=%d pub2=%d ok3_expected0=%d | "
-           "slot0_intact=%d drops=%u | rel1=%d dup_expected0=%d state_errs=%u\n",
-           ok1, pub1, acq1, ok2, pub2, ok3,
-           slot0_intact, bus.pool_exhausted_drops,
-           rel1_ok, rel1_duplicate, bus.invalid_state_errors);
+    bool pass = pub1 && pub2 && !ok3 && slot0_intact && rel1_ok
+                && !rel1_duplicate && (bus.pool_exhausted_drops == 1U)
+                && (bus.invalid_state_errors == 1U) && (wbuf3 == NULL)
+                && (p_h3.generation == 0U);
 
-    return 0;
+    /* Reuse Slot 0 at generation 2; queue order is now Slot 1 then Slot 0. */
+    slot_handle_t reused;
+    uint8_t *new_buf = NULL;
+    if (!p1_producer_alloc(&bus, &reused, &new_buf)) {
+        fprintf(stderr, "FAIL: reuse allocation\n");
+        return 1;
+    }
+    pass = pass && (reused.slot_id == c_h1.slot_id)
+                && (reused.generation == 2U);
+    new_buf[0] = 0xA5U;
+    bool republished = p1_producer_publish(&bus, reused, 1U);
+
+    slot_handle_t current;
+    const uint8_t *data = NULL;
+    uint16_t len = 0U;
+    if (!p1_consumer_acquire(&bus, &current, &data, &len)) {
+        fprintf(stderr, "FAIL: second payload acquisition\n");
+        return 1;
+    }
+    pass = pass && (len == 8U) && (memcmp(data, "FAULT_02", 8U) == 0);
+    bool second_released = p1_consumer_release(&bus, current);
+    if (!p1_consumer_acquire(&bus, &current, &data, &len)) {
+        fprintf(stderr, "FAIL: reused payload acquisition\n");
+        return 1;
+    }
+    bool stale_released = p1_consumer_release(&bus, c_h1);
+    pass = pass && republished && second_released && !stale_released
+                && (current.slot_id == reused.slot_id)
+                && (len == 1U) && (data[0] == 0xA5U)
+                && (bus.slots[current.slot_id].state == SLOT_IN_USE)
+                && (bus.invalid_state_errors == 2U);
+    bool current_released = p1_consumer_release(&bus, current);
+
+    /* An oversized publish leaves FILLING ownership available for abort. */
+    slot_handle_t aborted;
+    uint8_t *abort_buf = NULL;
+    if (!p1_producer_alloc(&bus, &aborted, &abort_buf)) {
+        fprintf(stderr, "FAIL: abort-case allocation\n");
+        return 1;
+    }
+    bool oversized = p1_producer_publish(&bus, aborted, P1_PAYLOAD_BYTES + 1U);
+    pass = pass && !oversized
+                && (bus.slots[aborted.slot_id].state == SLOT_FILLING);
+    bool abort_ok = p1_producer_abort(&bus, aborted);
+    bool empty = !p1_consumer_acquire(&bus, &current, &data, &len);
+    pass = pass && current_released && abort_ok && empty
+                && (data == NULL) && (len == 0U) && (current.generation == 0U)
+                && (bus.q_count == 0U);
+    for (uint16_t i = 0U; i < P1_POOL_SLOTS; ++i) {
+        pass = pass && (bus.slots[i].state == SLOT_FREE);
+    }
+    printf("C03 ownership checks: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
 }
 ```
 
@@ -541,7 +662,7 @@ int main(void)
 
 ## Complete Scenario Walkthrough: Tracing Slot 0 And Slot 1 Through Burst Overload And Double-Release
 
-Trace the exact memory state in `main()` above step by step:
+Trace the initial burst and duplicate-release case in `main()` step by step:
 
 1. **After `p1_bus_init(&bus)`:**
    * `Slot 0`: `state = SLOT_FREE`, `generation = 1`
@@ -554,10 +675,16 @@ Trace the exact memory state in `main()` above step by step:
    * `p1_consumer_acquire()` pops `{id=0, len=8, gen=1}`, moves `Slot 0` to **`SLOT_IN_USE`**, and gives the Consumer a read-only `const uint8_t *` to `Slot 0`'s `payload[]`.
 4. **Two Fast Interrupt Bursts Arrive Before Consumer Finishes `Slot 0`:**
    * **Burst A (`"FAULT_02"`):** `p1_producer_alloc()` sees `Slot 0` is `SLOT_IN_USE` (skips it!) and claims **`Slot 1`** (`SLOT_FREE -> SLOT_FILLING`, `{id=1, gen=1}`), writes `"FAULT_02"`, and publishes `Slot 1` (`SLOT_READY`). **`Slot 0` (`"FAULT_01"`) is 100% untouched!**
-   * **Burst B:** `p1_producer_alloc()` scans `Slot 0` (`SLOT_IN_USE`) and `Slot 1` (`SLOT_READY`). Zero `SLOT_FREE` slots exist -> increments **`pool_exhausted_drops` (`0 -> 1`)** and returns `false` cleanly in `O(1)` time without blocking or corrupting either buffer!
+   * **Burst B:** `p1_producer_alloc()` scans `Slot 0` (`SLOT_IN_USE`) and `Slot 1` (`SLOT_READY`). Zero `SLOT_FREE` slots exist -> increments **`pool_exhausted_drops` (`0 -> 1`)** and returns `false`. Allocation scans at most `P1_POOL_SLOTS` entries: `O(N)` in slot count, bounded to two checks here.
 5. **Consumer Releases `Slot 0` (And Tests Buggy Double-Release):**
    * First `p1_consumer_release(c_h1)` (`{id=0, gen=1}`): matches `Slot 0` (`SLOT_IN_USE`, `gen == 1`) -> bumps **`Slot 0` `generation` from `1` to `2`** and sets `Slot 0` back to **`SLOT_FREE`**.
    * Second `p1_consumer_release(c_h1)` (`{id=0, gen=1}`): sees `Slot 0` is `SLOT_FREE` and `gen == 2 != 1` -> increments **`invalid_state_errors` (`0 -> 1`)** and returns `false`!
+
+The remaining checks reuse Slot 0 at generation 2, consume Slot 1 first
+(FIFO order), then reject the old generation-1 release while Slot 0 is
+`IN_USE` again. The error counter becomes `2`. Finally, an oversized publish
+leaves its slot `FILLING`; abort returns it to `FREE`. The expected ending
+state is an empty queue with both slots free.
 
 ---
 
@@ -576,10 +703,18 @@ A notification only rings a doorbell to say *"something happened"*—it does not
 
 ### Q2: When do you choose a Copy Queue (`xQueueSendFromISR` copying the struct) vs. a Zero-Copy Pool (`xQueueSendFromISR` sending a slot ID)?
 * **Simple answer:** Copy by value for small commands/events (`<= 16–32 bytes`); use a zero-copy static slot pool for larger sensor/DMA blocks (`64+ bytes`).
-* **How it works:** FreeRTOS `xQueueSendFromISR` runs `memcpy` inside a `BASEPRI` critical section. Copying `8 bytes` takes ~2 instructions, whereas copying `512 bytes` keeps interrupts masked much longer.
-* **Why / Trade-off:** Copy queues have simpler lifetime rules (no `release()` call to forget), while zero-copy pools keep critical sections `O(1)` regardless of payload size at the cost of explicit slot-release accounting.
+* **How it works:** Queue copying contributes to the masked interval. Instruction count and duration depend on the compiler, alignment, memory and API overhead; measure against the interrupt-latency budget rather than using a universal byte threshold.
+* **Why / Trade-off:** Copy queues have simpler lifetime rules (no `release()` call to forget). Pool metadata work is independent of payload size, but this allocator scans `N` slots; ownership and error recovery add complexity.
 
 ### Q3: What should an ISR producer do when the queue or buffer pool is full?
 * **Simple answer:** Never block or spin-wait inside an ISR; apply an explicit bounded overload policy (typically **Drop-Newest** with an atomic drop counter) and unwind any allocated slot back to `FREE`.
-* **How it works:** If `pool_alloc()` returns `false`, increment `pool_exhausted_drops` and exit the ISR cleanly; if `pool_alloc()` succeeded (`FILLING`) but `xQueueSendFromISR()` failed, transition that slot back to `FREE` before exiting.
+* **How it works:** This allocator already counts pool exhaustion; do not increment the same counter again in its caller. After a later handoff failure, record that failure and abort only a slot still owned by the producer. A DMA-owned slot first needs confirmed cancellation/completion.
 * **Why / Trade-off:** Preserves already-captured older fault evidence in the queue (`Drop-Newest`) and makes overload observable in telemetry instead of silently losing data or deadlocking the MCU.
+
+## Corrections
+
+- 2026-11-17: Approved source-only repair: initialized payload length,
+  DMA completion/quiescence, observable handoff errors, failed-publish abort,
+  pointer/non-aliasing and generation-wrap contracts, bounded linear pool scan,
+  and checks with a failing exit status. The host model remains sequential and
+  unexecuted; no universal copy-size or instruction-count threshold is claimed.
