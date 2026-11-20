@@ -9,13 +9,19 @@ The [tracker](../../plans/training_tracker.md) owns learning status;
 the [log](../../plans/learning_log.md) records actual evidence.
 This index is a reading guide, not another schedule.
 
-## Current MCU Track
+## Current Interview-Focused FreeRTOS & MCU Track (Updated 2026-11-20)
 
-On2026-10-26 the learner approved FreeRTOS-first MCU/driver development with a
-bounded Zephyr project. Linux kernel/IIO/Yocto lessons are not active
-prerequisites.
+On **2026-11-20**, the learner approved the **10-Day (Extensible) Interview-Focused
+MCU, Embedded C & FreeRTOS Plan** ([schedule](../../plans/five_month_development_roadmap.md#5-weekly-schedule);
+prior hardware-first snapshot preserved in [backup/plan/2026-11-20-mcu-hardware-track](../../backup/plan/2026-11-20-mcu-hardware-track/README.md)).
+FreeRTOS is the sole active RTOS tool, taught in plain English from official
+sources with a complete theoretical `P1` reference architecture connected honestly
+to day-to-day AURIX work (`Zephyr` and Linux kernel/IIO/Yocto are excluded; board
+runs are optional/not required).
 
-**Current topics 10–19 (`W01-L15`..`W04-L24`: Cortex-M4 Architecture -> Bare-Metal -> MPU -> PendSV -> BSP -> C02 Unwind -> FreeRTOS -> C03 Ownership -> Synchronization):**
+**Published Foundation & Day 1 (`W01-L15`..`W04-L26`):**
+
+Start Day 1 with [three bytes arrive while the driver task is asleep](W04_L26_day_1_tutoring.md); the detailed reference is under Topic 21 below.
 - **Topic 10 (`W01-L15`):** [Thumb, Arm instruction sets, and important Cortex-M4 instructions](W01_L15_thumb_and_arm_instruction_sets.md).
 - **Topic 11 (`W01-L16`):** [Arm Cortex-M4 important core registers, reset state, and system register blocks](W01_L16_cortexm4_reset_registers.md).
 - **Topic 12 (`W01-L17`):** [Complete bare-metal 84 MHz startup, vector table, B1 interrupt handoff, and LD2 debounce (linker script only)](W01_L17_b1_exti_interrupt_handoff_and_debounce.md).
@@ -25,7 +31,9 @@ prerequisites.
 - **Topic 16 (`W02-L21` — `C02`):** [Three-resource initialization and reverse-order unwind (`C02`) — Linux kernel (`goto`), FreeRTOS, and AUTOSAR / MISRA-C](W02_L21_c02_three_resource_init_and_reverse_unwind.md).
 - **Topic 17 (`W03-L22`):** [FreeRTOS from the ground up — task states, TCB & lists, priorities, `vTaskDelayUntil`, and ISR task notifications (`P1`)](W03_L22_freertos_tasks_states_delays_and_notifications.md).
 - **Topic 18 (`W03-L23` — `C03`):** [Event producer/consumer ownership model (`C03`) — payload lifetime, torn reads, copy queues, and zero-copy slot pools (`P1`)](W03_L23_c03_producer_consumer_payload_ownership.md).
-- **Topic 19 (`W04-L24`):** [FreeRTOS queues, semaphores, mutexes, critical sections and priority inversion (`P1`)](W04_L24_freertos_synchronization_and_priority_inversion.md).
+- **Topic 19 (`W04-L24`, rev 5):** [FreeRTOS queues (`pcWriteTo`/`pcReadFrom`, `SendToFront`, `1`-slot `xQueueOverwrite` mailbox), binary/counting semaphores, critical sections vs. `vTaskSuspendAll`, mutex priority inheritance, deadlock & gatekeeper tasks (`P1`)](W04_L24_freertos_synchronization_and_priority_inversion.md).
+- **Topic 20 (`W04-L25`, rev 5):** [I2C, SPI, ADC and DMA — simple foundations, generic cross-MCU `DMA` (`Stream` vs. `Channel`), 4 interrupt paths, and continuous 4-mode use-case scenarios](W04_L25_i2c_spi_debug_interrupts_and_dma.md).
+- **Topic 21 (`W04-L26` — Day 1 of 10-Day Interview Plan):** [FreeRTOS complete remaining interview pillars — `heap_1..heap_5` vs. static allocation, software timers (`"Tmr Svc"` daemon), event groups (`24` bits, `xEventGroupSync`, `SetBitsFromISR` trap), stream/message buffers (`SPSC` `DMA -> Task`), stack overflow (`Method 1/2` vs. `MPU`), runtime stats & tickless idle](W04_L26_freertos_heaps_timers_event_groups_stream_buffers_and_diagnostics.md).
 
 **Review/publication update, 2026-11-17:** L20-L23 were reviewed and repaired
 with approval; the four earlier L17-L19 findings were rechecked. L19's runtime

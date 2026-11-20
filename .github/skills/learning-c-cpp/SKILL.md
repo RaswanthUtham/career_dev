@@ -62,8 +62,8 @@ automatically in exercise files. Never replace student work without permission.
 
 ## Project Practice
 
-Use the roadmap's [C01-C21 table](../../../plans/five_month_development_roadmap.md#weekly-c-practice-c01-c21)
-inside the existing two-hour weekly block, not a second skill-owned schedule.
+Use the [active sprint's C patterns and worked cases](../../../plans/five_month_development_roadmap.md#weekly-c-practice-c01-c21)
+on their assigned days. There is no separate weekly practice block.
 State the selected ISO C/host-test/FreeRTOS/Zephyr/MCU model, contract, complexity and tests.
 Use FreeRTOS/Zephyr/MCU examples for the active projects. Linux kernel macro/API
 comparisons remain historical/explicit-request only, not weekly requirements.

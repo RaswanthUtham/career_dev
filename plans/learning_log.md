@@ -2196,3 +2196,76 @@ explicit limitation.
   untouched) and updated `notes/lessons/README.md`.
 - **Limits:** teaching Markdown, index, and log updates only; no project source
   changes, builds, or hardware runs performed.
+
+## 2026-11-20: Clarified W04-L24 (Rev 3) — Exact RAM Layout Of `xQueueCreate(2, 8)`, Concrete Per-API Use Cases, And Zero-Gap Synchronization Explanations
+
+- **Request:** explain Scene 1 of
+  [W04-L24](../notes/lessons/W04_L24_freertos_synchronization_and_priority_inversion.md)
+  (`xQueueCreate(2, 8)` — what `2` slots means and whether it is a 2D array),
+  provide a simple human-picturable example use case for every FreeRTOS function
+  introduced, and audit the rest of `W04-L24` to remove any explanation gaps.
+- **Updates applied:**
+  1. Showed how `xQueueCreate(2, 8)` maps mentally to `uint8_t mailbox[2][8]`
+     and physically in RAM to `Queue_t` + a flat `16`-byte array (`storage[0..7]`
+     = Slot `0`, `storage[8..15]` = Slot `1`), contrasted directly against the
+     `0`-byte item storage of Binary Semaphores, Counting Semaphores, and
+     Mutexes (`pxMutexHolder` + `uxBasePriority`/`uxPriority`).
+  2. Added concrete real-world use cases and C snippets for every function:
+     `xQueueCreate`, `xQueueSend` (task with `wait_ticks`) vs.
+     `xQueueSendFromISR` (`ISR` with `&woken` + `portYIELD_FROM_ISR`),
+     `xQueueReceive`, `xSemaphoreCreateBinary`, `xSemaphoreCreateCounting`
+     (event counting vs. free-buffer pool counting), `xSemaphoreCreateMutex`
+     (including self-deadlock and DMA hold-until-complete traps),
+     `taskENTER_CRITICAL` (nesting `uxCriticalNesting`),
+     `taskENTER_CRITICAL_FROM_ISR`, and `vTaskSuspendAll`.
+- **Limits:** teaching Markdown and log updates only; no project code edits,
+  builds, or target runs performed.
+
+## 2026-11-20: Rewrote W04-L24 (Rev 4) From Official FreeRTOS Kernel Source & Official Training Book, And Codified Zero-Gap Verification Rules In Skills
+
+- **Request:** rewrite
+  [W04-L24](../notes/lessons/W04_L24_freertos_synchronization_and_priority_inversion.md)
+  completely by verifying every concept against official FreeRTOS documentation,
+  kernel source, and official training materials (*Mastering the FreeRTOS Real
+  Time Kernel*), leaving zero gaps on slot indices (`Slot 0` vs. `Slot 1` when
+  `uxMessagesWaiting == 1`), arrival windows (*before*, *during*, and *after*
+  `Task H`), full-queue overwrite rules (`errQUEUE_FULL` vs. length-`1`
+  `xQueueOverwrite` Mailboxes), and per-API use cases; and codify these rules
+  in the project teaching skills.
+- **Sources verified:** upstream `FreeRTOS/FreeRTOS-Kernel` (`queue.c`:
+  `QueueDefinition`, `xQueueGenericReset`, `prvCopyDataToQueue`,
+  `prvCopyDataFromQueue`, `xQueueSemaphoreTake`, `xQueueTakeMutexRecursive`),
+  official `FreeRTOS/FreeRTOS-Kernel-Book` (*Mastering the FreeRTOS Real Time
+  Kernel*, Chapters 5, 7, and 8), and CubeF4 V1.28.3 `tasks.c`.
+- **Updates applied:**
+  1. Updated `.github/skills/learning-feynman-coach/SKILL.md` and
+     `.github/skills/learning-arm-rtos/SKILL.md` with the mandatory
+     **Official Documentation / Source Grounding & Zero-Gap State Walkthrough**
+     rules.
+  2. Rewrote `W04-L24` (Revision 4) covering exact `Queue_t` RAM layout and
+     `pcWriteTo`/`pcReadFrom` circular slot positions (`Slot 0` vs. `Slot 1`),
+     all 4 timing scenarios (*before*, *during* [`BASEPRI` + post-`Receive`],
+     *after*, and *full*), `xQueueSendToBack` vs. `xQueueSendToFront` vs.
+     length-`1` `xQueueOverwrite`/`xQueuePeek` Mailboxes, Ch 7.4.4's 3-interrupt
+     burst & `while`-drain pattern, Counting Semaphores, Critical Sections vs.
+     `vTaskSuspendAll`, Simplified Priority Inheritance caveats, Deadlock /
+     Recursive Mutexes / Same-Priority tight-loop starvation, Gatekeeper Tasks,
+     and `p1_sync_complete.c`.
+- **Limits:** skill, teaching Markdown, index, and log updates only; no project
+  code changes, builds, or hardware runs performed.
+
+### 2026-11-20 — `W04-L24` Rev 5 Source Audit, Pre-Pivot Backup Snapshot, 10-Day Interview Plan & `W04-L26` Publication
+
+- **Learner requests:**
+  1. Clarify exact `Queue_t` `Slot 0` vs. `Slot 1` `pcReadFrom`/`pcWriteTo` wrap-around (`>= pcTail`), audit all of `W04-L24` against official FreeRTOS source, and disambiguate `g_uart_rx_sem` count (`0->1`) vs. local `woken` (`pdFALSE`).
+  2. Take a full backup of the previous plan/skills, pivot to an **Interview-Focused, Reading-First Preparation Plan** (`10` days baseline at `1.5–2 h/day`, freely extensible so **zero required/important concepts are skipped**; FreeRTOS as the sole RTOS tool; plain-English explanations; no mandatory hands-on board runs; theoretical `P1` design connected honestly to day-to-day AURIX work), and publish the remaining official FreeRTOS interview pillars (`W04-L26`) immediately.
+- **Backup verified:** Copied 62 working files (`README.md`, `career_dev.code-workspace`, `.github/copilot-instructions.md`, `plans/*`, `docs/*.md`, `notes/**/*`, and `.github/skills/*/SKILL.md`) into `backup/plan/2026-11-20-mcu-hardware-track` and `backup/skills/2026-11-20-mcu-hardware-track` with `100%` SHA-256 verification recorded in `manifest.csv`.
+- **Plan, skills & lessons updated:**
+  1. Repaired `W04-L24` (Revision 5) against `queue.c`, `semphr.h`, and `GCC/ARM_CM4F/portmacro.h` (aligned `0x100`/`0x108`/`0x110` 6-step cursor diagrams, `pxQueue->u.xQueue.pcTail`, `pcHead == NULL` mutex marker, `SendToFront`/`Overwrite` backward-wrap math, `NVIC_SetPriorityGrouping(3U)`, and unambiguous `g_uart_rx_sem` vs. `woken` comments).
+  2. Updated `plans/five_month_development_roadmap.md`, `plans/project_portfolio.md`, `plans/training_tracker.md`, `.github/copilot-instructions.md`, `learning-feynman-coach/SKILL.md`, and `learning-arm-rtos/SKILL.md` for the 10-Day Interview-Focused Plan (`Days 1–10` / `W04-L26`..`W04-L35`).
+  3. Verified upstream `FreeRTOS-Kernel` (`heap_4.c`, `timers.c`, `event_groups.c`, `stream_buffer.c`, `include/stack_macros.h`) and *Mastering the FreeRTOS Real Time Kernel* (`Ch 3, 6, 9, 11–13`), and published [W04-L26](../notes/lessons/W04_L26_freertos_heaps_timers_event_groups_stream_buffers_and_diagnostics.md) (Day 1).
+- **Limits:** backup, plan, skill, and lesson Markdown updates only; publication does not establish learner mastery or runtime hardware verification. Next planned lesson: Day 2 (`W04-L27`) — Embedded C Live-Coding & Concurrency Traps (`C04` + `C05` + `C07` + `C11`).
+
+### 2026-11-20 — Interview gap corrections and Day 1 tutoring companion
+
+Integrated six worked cases into the existing sprint; clarified allocator terminology and deferred bench evidence. Published the [Day 1 reading guide](../notes/lessons/W04_L26_day_1_tutoring.md) alongside L26. The byte and timing examples are predicted traces, not observations. No learner assessment, code execution or hardware run. Day 2 remains next on the schedule.

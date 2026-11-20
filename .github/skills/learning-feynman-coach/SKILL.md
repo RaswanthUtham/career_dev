@@ -12,19 +12,21 @@ Read the [active roadmap](../../../plans/five_month_development_roadmap.md),
 not another calendar. Archived skills are references, never competing policies.
 If a required document is missing, identify the path and ask; do not invent it.
 
-Scope is MCU driver/firmware development: FreeRTOS first and bounded Zephyr.
-Explain C/RTOS foundations through acquisition, cyclic device service, timing,
-ownership, diagnostics and recovery. Linux kernel/IIO/Yocto and full teaching-
-kernel implementation are retired from the active course; existing lessons stay
-historical. Native Windows is the primary P1/P2 build/debug host; the
-learner-reported installed Ubuntu Server is optional infrastructure, not another
-course. Existing Podman host-C tests need not be migrated merely for consistency.
-The 2026-10-26 hardware-first choice removes QEMU/emulation as a prerequisite.
-Use available boards after readiness/permission gates. Optional host-C tests
-remain logic checks; neither reading a model nor building code proves a board run.
-Use [role evidence](../../../plans/career_role_evidence.md) for career claims.
-New experience reports describe driver implementation/integration AND testing,
-not validation only. Distinguish participation/review from ownership.
+Scope is **interview-focused MCU driver, Embedded C, and FreeRTOS mastery**
+(approved 2026-11-20; prior hardware-first plan preserved in
+`backup/plan/2026-11-20-mcu-hardware-track`): teach every required concept from
+ground up in **plain, everyday English** using **FreeRTOS** as the sole RTOS
+tool (`Zephyr`, Linux kernel/IIO/Yocto, and full teaching-kernel implementation
+are outside active scope). Hands-on board flashing/runs are **not required**
+right now: the learner is a working embedded professional (`10+ years C`) who
+absorbs concepts by reading clear, zero-gap walkthroughs and connecting the
+theoretical `P1` FreeRTOS driver architecture honestly to real day-to-day AURIX
+IC-driver cyclic functions, AUTOSAR integration, architecture/interface reviews,
+FMEA/HAZOP participation, Polyspace/MISRA, and integration testing. Never skip
+required/important interview topics—depth comes first, and study days/hours can
+be extended whenever needed. Use [role evidence](../../../plans/career_role_evidence.md)
+for career claims; distinguish real workplace deliveries from private theoretical
+reference designs.
 
 ## 1. Select Mode And Scale
 
@@ -134,6 +136,33 @@ easy to read and understand on the first pass:
     buildable C file once at the end of the lesson so the explanation scenes
     stay compact and easy to read. Do not add meta-sections listing "what is
     reused from previous lessons" or `BEGIN/END UNCHANGED` comment banners.
+- **Official Documentation / Source Grounding & Zero-Gap State Walkthrough:**
+  - **Verify Against Official Docs & Upstream Source First:** Before explaining
+    any RTOS, architecture, or peripheral mechanism, verify exact struct fields,
+    cursor/pointer movements, preconditions (`configASSERT`), return codes, and
+    edge cases against the **official specification / reference manual / kernel
+    source and official training guide** (e.g., official FreeRTOS Kernel source
+    `queue.c`/`tasks.c` + *Mastering the FreeRTOS Real Time Kernel* + official
+    FreeRTOS.org docs, Arm Cortex-M4 Generic User Guide, STM32 Reference Manual)
+    so zero assumed or hallucinated behavior enters the lesson.
+  - **Leave Zero Gaps On Slot Indices, Timing Windows, And Overflow Policies:**
+    Whenever explaining any queue, buffer, ring, semaphore, lock, or state
+    machine, explicitly answer the natural questions a human reader asks:
+    1. **Exact Slot / Cursor Position:** Never say only *"count = 1"*; show
+       **which exact slot (`Slot 0` vs. `Slot 1`)** holds the item, where the
+       read and write pointers point, and why a later single item can sit in
+       `Slot 1` instead of `Slot 0` after wrap-around.
+    2. **All Three Timing Windows (`Before`, `During`, `After`):** Trace what
+       happens if a 2nd event arrives **before** the consumer runs, **during**
+       consumer execution (both inside the brief critical section and while
+       processing payload code), and **after** the consumer finishes.
+    3. **Full / Empty / Overwrite Truth:** State explicitly whether a full
+       structure **rejects the new item (`Drop-Newest` / `errQUEUE_FULL`),
+       blocks the sender (`xTicksToWait`), or overwrites an existing slot**
+       (and *which* slot and *which separate API*, e.g., `xQueueOverwrite` only
+       on length-`1` mailboxes).
+    4. **Concrete Use Case Per Function:** Give a clear, real-world embedded
+       use case and short example for **every** API function introduced.
 - **Document Lookup & Reference Provenance Cheat-Sheet:**
   - Include a compact lookup table mapping hardware addresses, bitfields,
     memory capacities, clock/wait-state limits, and board pin/component

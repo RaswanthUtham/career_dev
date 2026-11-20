@@ -8,42 +8,43 @@ Start with [setup](../docs/workspace_setup.md), the
 
 ## Goal And Scope
 
-The learner targets INR 90 LPA total CTC and Staff/Principal-oriented embedded
-development capability. These are aspirations, not guaranteed salary, hiring
-level or outcomes. Preparation/interviews aim for 22 March 2027 at 22 hours/week;
-joining may follow. The learner approved MCU/firmware/RTOS focus on2026-10-26:
+The learner targets Senior / Lead / Staff embedded firmware, MCU driver, and RTOS
+roles in Bengaluru (aspirational INR 90 LPA total CTC; Principal selective where
+scope supports it; no salary, hiring level, or outcome is guaranteed).
 
-- P1: FreeRTOS cyclic peripheral service and fault recorder.
-- P2: bounded Zephyr diagnostic supervisor and programmable test node.
+On **2026-11-20**, the learner approved an **Interview-Focused, Reading-First
+Preparation Pivot** (`10-Day` baseline sprint at `~1.5–2 hrs/day` aiming to
+finalize the resume and start attending interviews in ~10 days, freely extensible
+in days or study hours so **zero required or important topics are skipped**):
 
-Remove Linux kernel/module/IIO/Yocto and teaching-kernel work from the active
-curriculum. Keep C, datasheet-driven drivers, interrupts, timers/ADC/DMA,
-bounded memory, scheduling, diagnostics and verification. FreeRTOS first, then
-Zephyr; not two parallel full curricula. Linux is a build host only.
-Tie foundational concepts to P1/P2 or a concrete MCU prerequisite.
-Use native Windows on the current HP for P1 and initially P2. The other HP's
-Ubuntu Server installation is learner-reported, with exact release/SSH/tools
-unverified; keep it optional. No QEMU, separate WSL or container is required.
-Follow setup/tracker for observed installed STM32 tools and readiness; do not
-equate executable/package presence with a successful build or board run.
+- **FreeRTOS as the sole active RTOS tool:** Teach all required RTOS, MCU,
+  Embedded C, peripheral/`DMA`, fault-debugging, and real-time design concepts
+  in **plain, simple English**, grounded in official manuals, upstream
+  `FreeRTOS-Kernel` source, and *Mastering the FreeRTOS Real Time Kernel*.
+- **No mandatory hands-on board runs or Zephyr setup:** As a working embedded
+  professional (`10+ years C`), the learner connects plain-English theory and
+  complete code walkthroughs directly with practical workplace experience.
+  `Zephyr` (`P2`), Linux kernel/module/IIO/Yocto, and `my-linux` remain excluded.
+- **Theoretical `P1` Architecture Connected Honestly to Day-to-Day Work:**
+  `P1` (FreeRTOS asynchronous cyclic IC driver service, `DMA` acquisition,
+  progress watchdog & fault recorder) is taught as a complete theoretical/code
+  reference design and mapped 1-to-1 to the learner's real AURIX engineering work.
 
 Learner-reported experience includes AURIX IC-driver cyclic functions,
 AUTOSAR integration, architecture/interface reviews, integration tests,
 requirements traceability and mentoring, plus FMEA/HAZOP participation with
 safety engineers and Polyspace/MISRA analysis. Do not describe this as
-validation-only, or inflate it to safety-case or architecture ownership.
-Private learning projects may inspire an employer-approved improvement; they
-are not employer deliveries until actually adopted. Keep claims truthful and
-original code separate from confidential workplace artifacts.
+validation-only, inflate it to safety-case or architecture ownership, or present
+private theoretical designs/unrun examples as employer deliveries or physical
+measurements. Keep claims truthful and original code separate from confidential
+workplace artifacts.
 
-Preserve the long-term foundation in [backup/plan](../backup/plan/2026-10-22-foundation/README.md)
-and [backup/skills](../backup/skills/2026-10-22-foundation/README.md).
-The [2026-10-26 plan](../backup/plan/2026-10-26-linux-rtos-track/README.md) and
-[skills](../backup/skills/2026-10-26-linux-rtos-track/README.md) preserve the retired
-Linux/RTOS track.
-Never edit snapshot files, register archived skills as active, or follow the
-archived calendar automatically. Existing historical notes remain references;
-known defects are recorded in the tracker. Legacy personal skills stay untouched.
+Preserve all three historical snapshots untouched:
+- [backup/plan/2026-10-22-foundation](../backup/plan/2026-10-22-foundation/README.md) & [skills](../backup/skills/2026-10-22-foundation/README.md)
+- [backup/plan/2026-10-26-linux-rtos-track](../backup/plan/2026-10-26-linux-rtos-track/README.md) & [skills](../backup/skills/2026-10-26-linux-rtos-track/README.md)
+- [backup/plan/2026-11-20-mcu-hardware-track](../backup/plan/2026-11-20-mcu-hardware-track/README.md) & [skills](../backup/skills/2026-11-20-mcu-hardware-track/README.md)
+Never edit snapshot files, register archived skills as active, or follow an
+archived calendar automatically.
 
 ## Routing And Modes
 

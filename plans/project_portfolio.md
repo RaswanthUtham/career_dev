@@ -1,25 +1,30 @@
-# Private MCU Project Contracts
+# Theoretical Capstone Project (`P1`) & Workplace Connection Contract
 
-Approved MCU/FreeRTOS-first scope, 2026-10-26. Projects are planned, not built.
-[Roadmap](five_month_development_roadmap.md) owns hours/dates;
-[tracker](training_tracker.md) owns evidence; [boards](../docs/board_inventory.md)
-owns photo provenance.
+Updated with learner approval on 2026-11-20 ([previous hardware-track contract](../backup/plan/2026-11-20-mcu-hardware-track/snapshot/plans/project_portfolio.md)).
+[10-Day Plan](five_month_development_roadmap.md) owns schedule;
+[Tracker](training_tracker.md) owns status.
 
-## Purpose And Truthful Use
+## Purpose And Truthful Interview Framing
 
-Deepen skills through problems seen in professional driver engineering, not
-through a broad demonstration of every framework. Initial work is private
-learning work using public specifications or an explicitly original device model.
-No employer code, register protocol, test vectors or confidential architecture
-are copied. No public GitHub showcase, commit or push is required.
+As an experienced working engineer (`10+ years C`, 32-bit Infineon **AURIX** motor-control/BMS IC cyclic driver functions, AUTOSAR CDD integration, architecture/interface reviews, integration tests, FMEA/HAZOP participation, Polyspace/MISRA), you do **not** need hobbyist LED/board demos right now. Instead, `P1` serves as a **complete, Staff-grade theoretical & code-level FreeRTOS reference architecture** that:
+1. Lets you see **every RTOS, peripheral, `DMA`, memory-safety, and fault-recovery mechanism** working together in one realistic MCU subsystem (`Day 8 / W04-L33`).
+2. Maps **1-to-1 to your real day-to-day AURIX driver & integration engineering**, so in interviews you can explain both **how you solved cyclic IC communication, timeout/retry, diagnostics, and safety analysis at work** AND **how you design the exact same subsystem on Arm Cortex-M + FreeRTOS**.
+3. Keeps **100% professional honesty**: no confidential employer register maps or proprietary code are copied here, and `P1` is presented honestly as a reference architecture / design study rather than a fabricated workplace product or unrun hardware measurement. (`P2` Zephyr is deferred outside the active FreeRTOS-focused interview track.)
 
-The learner may propose a resulting idea at work through the employer's IP,
-review and safety processes. Only after actual approval/adoption may it be
-described as workplace work, with accurate authorship, implementation scope,
-review responsibility and results. This plan is not evidence of employment at
-Infineon or of an already-delivered company project.
+## P1. FreeRTOS Asynchronous Cyclic IC Driver Service, `DMA` Acquisition & Fault Recorder
 
-## P1. FreeRTOS Cyclic Peripheral Service And Fault Recorder
+### 1-To-1 Bridge Between Your Day-To-Day AURIX Work And `P1` (FreeRTOS / Cortex-M)
+
+| Day-To-Day AURIX / AUTOSAR Engineering Concept | FreeRTOS + Cortex-M (`P1`) Equivalent You Explain In Interviews |
+| --- | --- |
+| Periodic `1 ms` / `10 ms` AUTOSAR Runnable & Cyclic IC MainFunction | FreeRTOS periodic task using `vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10U))` (`W03-L22`) |
+| Non-blocking IC SPI/I2C register sequence (`ISSUE -> WAIT_COMPLETE -> VALIDATE -> RECOVER`) | Bounded driver state machine (`UNINIT -> INIT_VERIFY -> IDLE -> BUSY_ASYNC -> RECOVERING -> SAFE_DEGRADED`) woken via `xTaskNotifyWait` / `DMA` completion ISR (`W04-L25`, `Day 8`) |
+| `SchM_Enter` / `SuspendAllInterrupts` short critical section | `taskENTER_CRITICAL()` (`BASEPRI = 0x50`, `< 1 us` `Task <-> ISR`) vs. `vTaskSuspendAll()` (locks scheduler without delaying `ISR`s) (`W04-L24`) |
+| Shared bus / configuration protection across priority levels | FreeRTOS Mutex (`xMutexHolder` + Priority Inheritance) or zero-lock **Gatekeeper Task** (`W04-L24`) |
+| High-rate ADC/sensor burst buffering | `xQueueCreateStatic` uses caller-supplied storage; a fixed `C03` pool can hold the payloads. Alternatively `heap_4` is a dynamic allocator, even if used only at startup. Coalescing adjacent free blocks reduces fragmentation; it cannot merge holes separated by a live object. |
+| AUTOSAR `WdgM` Alive + Program-Flow Deadline Supervision | FreeRTOS Supervisor Task verifying per-task alive bitmasks + checkpoint ordering before kicking hardware `IWDG`/`WWDG` (`Day 4 / L29`) |
+| DEM / Fault Event Memory & Safe Degraded State (FMEA-driven) | Bounded `FaultRecord` queue + persistent `.noinit` / flash ring with sequence epoch, CRC, overflow drop counter, and deterministic safe output (`Day 4 & Day 8`) |
+| Polyspace / MISRA-C static safety & memory partitioning | Zero runtime `malloc` after `vTaskStartScheduler()`, reverse-order init unwind (`C02`), checked frame bounds (`C01`/`C05`), stack watermark + Cortex-M `MPU` guard (`W01-L18`, `W04-L26`) |
 
 ### Real Problem
 
@@ -43,7 +48,7 @@ timer / request -> bounded cyclic service -> device protocol state machine
                snapshot + fault ring -> low-priority UART export
 ```
 
-Use the available boards; no QEMU/emulator is required. First exercise a
+**Deferred hardware validation only:** If bench work resumes, first exercise a
 synthetic register device in board firmware, with optional host-C unit tests.
 Its interface must
 state reset values, ready/fault flags, transfer sizes, sequence/checksum policy
@@ -80,7 +85,12 @@ Not a real motor controller, BMS protection unit or high-energy test installatio
 4. Timeout/retry/degraded policy; evidence needed to justify recovery.
 5. MCU sampling timestamp versus export time and reset epoch.
 
-### Acceptance
+### Interview walkthrough versus deferred hardware acceptance
+
+For Day 8, draw the workplace boundary and P1 separately, and trace the
+deadline/cancellation cases in the roadmap. Label predicted results **expected**.
+The table below applies only to a future implementation; builds, board runs
+and measured timing are not sprint completion requirements.
 
 | Area | Required evidence, not yet achieved |
 | --- | --- |
@@ -95,84 +105,9 @@ Use bench LEDs/status records as the modeled safe/degraded output. Do not
 control a vehicle, real battery pack, mains-powered actuator or motor power
 stage. Model sensor faults first; hardware claims require safe measured inputs.
 
-## P2. Zephyr Diagnostic Supervisor And Programmable Test Node
+## P2. Zephyr Diagnostic Supervisor And Bench Extensions (Deferred — Outside Active 10-Day Interview Track)
 
-### Real Problem
-
-Driver teams need repeatable faults and timing scenarios instead of waiting for
-an intermittent failure to occur on a bench. Build a standalone MCU that runs
-bounded sensing/status tasks, accepts a small diagnostic command set and
-reproduces documented data/fault scenarios.
-
-**Primary board:** F767ZI. **OS:** one pinned Zephyr release/SDK.
-Run independently before any link to P1.
-
-```text
-scripted scenario / local input -> event/state model -> bounded response queue
-                  |                         |
-          periodic acquisition        diagnostic transport
-                  |                         |
-             local status <------ useful-progress supervision
-```
-
-### Core Requirements
-
-- Start with UART commands, local button/LEDs and synthetic data. Network,
-  display and CAN are not prerequisites.
-- Define task periods, deadlines, priority ordering and maximum blocking.
-  Demonstrate controlled priority inversion and compare inheritance with
-  single-owner/message-passing design.
-- Simulate stale/invalid measurements, slow consumers and a stalled worker
-  using explicit reproducible scenarios. No random unsafe register pokes.
-- Supervise useful progress, not merely scheduled execution. Watchdog recovery
-  needs preserved fault context and an approved reset/recovery procedure.
-- Use Zephyr Ztest for scoped unit/integration scenarios; Twister where supported.
-  Separate optional host logic tests, on-board synthetic fault scenarios and
-  physical device/timing measurements; no emulator is required.
-- Pin Kconfig/devicetree and driver dependencies; the board DTS's existence is
-  not proof all peripherals or target-mode APIs work.
-- M7 cache/MPU and DMA-accessible memory placement are taught only on a selected
-  actual DMA path. Do not disable cache globally as a substitute for analysis.
-
-### Optional Extension Gate
-
-After both standalone cores, select ONE extension within the existing budget:
-CAN peer diagnostics, a verified SPI/I2C target model, a low-priority display,
-Ethernet telemetry, or the bounded Pico experiment below. Check framework
-support first. Physical CAN requires
-transceivers/termination; F767 SPI/Ethernet PA7 conflict and silicon errata are
-real gates. No unsupported peripheral is silently treated as working.
-
-Pico/ESP32 may act as a separate fixture after validation. An ESP-IDF/FreeRTOS
-fallback is not evidence of Zephyr compatibility. Do not maintain three full
-SDKs solely to demonstrate a protocol.
-
-### Acceptance
-
-| Area | Required evidence, not yet achieved |
-| --- | --- |
-| Standalone | Starts and produces local status/diagnostics without Linux or P1 |
-| Scheduling | Priority/blocking decisions, inversion experiment and overload behavior |
-| Fault supervision | Stale source, stuck progress and recovery traces with clear expected outcomes |
-| Test reproducibility | Scenario IDs, known inputs, bounded waits and machine-readable outcomes |
-| Memory/time | Stack/queue budgets and measured timing under declared load |
-| Optional peer | Separate physical transport evidence, not just software loopback |
-
-## Optional Pico Multicore Experiment (Approved 2026-11-07)
-
-**Role:** a later learning extension, not a replacement for F446RE P1 or
-F767ZI P2. Use the existing Week 17 optional slot only after the standalone
-project cores and single-core FreeRTOS foundations are sound; otherwise defer.
-
-- Keep the present Pico effort to a bounded blink/toolchain check. UF2
-  availability is learner-reported; target execution remains unverified.
-- Pin a compatible Pico SDK, FreeRTOS kernel/RP2040 port and toolchain before
-  RTOS implementation. The
-  [RP2040 port](https://github.com/FreeRTOS/FreeRTOS-Kernel/tree/main/portable/ThirdParty/GCC/RP2040)
-  documents one-/two-core operation; inspected development-branch support is
-  not a tested project configuration.
-- Start with one-core producer/consumer behavior, then extend the same bounded
-  queue/buffer contract across two cores. No full P1 driver rewrite.
+> **2026-11-20 Update:** Per learner decision, **FreeRTOS is the sole active RTOS tool** for the interview-readiness track, and physical board flashing (`F446RE`, `F767ZI`, `Pico`) is **optional / deferred** so `100%` of study time goes into mastering every required C, Cortex-M, Peripheral/`DMA`, FreeRTOS, Fault-Debugging, and Architecture concept in plain English and connecting `P1` to day-to-day AURIX work. Task-progress watchdog supervision and Cortex-M7 `D-Cache`/`DMA` coherency from `P2` are folded directly into **Days 4 & 6 (`W04-L29` & `W04-L31`)** of the [10-Day Plan](five_month_development_roadmap.md#5-weekly-schedule). The historical `P2` and `Pico` contracts remain preserved in [backup/plan/2026-11-20-mcu-hardware-track](../backup/plan/2026-11-20-mcu-hardware-track/README.md).
 - Specify ownership, queue capacity, timeout and overflow behavior. Disabling
   interrupts on one core does not exclude accesses from the other core; use
   synchronization supported by the selected port.

@@ -12,21 +12,27 @@ Read the [shared coach](../learning-feynman-coach/SKILL.md), the
 work, not a quiz. Assess only on explicit request. No compulsory predictions
 while quizzes are paused. If a required skill is missing, state the path and ask.
 
-## Projects And Board Gates
+## Projects, Interview Mode And Scope (Updated 2026-11-20)
 
-P1 is a FreeRTOS cyclic peripheral service/fault recorder on F446RE. P2 is a
-bounded Zephyr diagnostic supervisor/test node on F767ZI. Teach FreeRTOS
-mechanisms and a working P1 first; transfer that knowledge into P2 rather than
-maintaining two large RTOS implementations in parallel.
-No Linux kernel/IIO/Yocto, custom RTOS kernel, full networking stack or
-commercial safety certification is part of the active core.
+Active mode is **Interview-Focused Plain-English FreeRTOS & MCU Mastery**:
+`P1` (FreeRTOS asynchronous cyclic IC driver service, `DMA` acquisition, task-
+progress watchdog, and fault recorder on Cortex-M4/`STM32F446RE`) is taught as a
+complete **theoretical & code-walkthrough reference architecture** connected
+1-to-1 to the learner's real workplace engineering. Hands-on board flashing and
+`P2` (`Zephyr`) are **deferred / not required** right now so every study hour
+goes into clear, zero-gap conceptual + code mastery for Senior/Lead/Staff
+interviews (never skipping important topics). No Linux kernel/IIO/Yocto, custom
+RTOS kernel, full networking stack or commercial safety certification is part of
+the active core.
 
 The learner reviews architecture/interface documents, implements AURIX
 motor-control/BMS IC driver cyclic functions, integrates AUTOSAR modules,
-writes integration tests and mentors. Build on those skills; do not assume
-Arm exception/ABI details from TriCore experience or teach proprietary device
-protocols from guesses. Keep AUTOSAR as limited explanatory context, not a
-mandatory new specialization.
+writes integration tests and mentors. Explicitly bridge each FreeRTOS/Cortex-M
+mechanism (`vTaskDelayUntil`, async `SPI`/`ADC`/`DMA` state machines, `BASEPRI`
+critical sections, Mutex inheritance vs. Gatekeeper, logical `WdgM`-style
+watchdog supervision, `D-Cache`/`DMA` coherency, fault rings) to those real
+day-to-day workflows without claiming TriCore and Cortex-M are identical or
+misrepresenting `P1` as a deployed employer product.
 
 Use the [photo inventory](../../../docs/board_inventory.md) and
 [fallback plan](../../../docs/board_project_plan.md) as current hardware evidence.
@@ -114,7 +120,16 @@ For FreeRTOS, first pin official kernel/tag, vendor/CMSIS dependencies, compiler
 Cortex-M port, interrupt-priority configuration, allocation scheme and relevant
 config options. Source is not yet installed merely because the roadmap names it.
 Read definitions/callers in `tasks.c`, `queue.c`, notification paths, timers and
-the selected `portable` port as needed; do not memorize API names alone.
+the selected `portable` port, alongside official FreeRTOS.org documentation and
+the official *Mastering the FreeRTOS Real Time Kernel* book, before writing
+explanations; never rely on memory or API names alone. When teaching queues,
+semaphores, mutexes, notifications, or ring buffers, always trace: (1) exact
+`Queue_t` / `TCB_t` fields and slot/cursor positions (`pcHead`, `pcTail`,
+`pcWriteTo`, `pcReadFrom`, `uxMessagesWaiting`, `xMutexHolder`) so the reader
+sees *which exact slot* holds data at each step, (2) all three arrival windows
+(*before*, *during*, and *after* consumer task execution), (3) exact full-buffer
+behavior (`errQUEUE_FULL` non-overwriting vs. length-`1` `xQueueOverwrite`
+mailbox vs. `xQueueSendToFront`), and (4) a concrete embedded use case per API.
 
 Explain task context versus ISR context before API choice. Inspect `FromISR`
 variants, the port's interrupt-priority limits and yield requirements; task
@@ -146,7 +161,7 @@ only after confirming electrical compatibility; record sample rate, clocks,
 compiler/configuration, probe points and instrumentation overhead. Report sampled
 latency distributions/maxima, not unproved worst-case deadlines.
 
-The practical gate includes normal behavior, one fault/recovery path, resource
+For deferred hardware validation only, the practical gate includes normal behavior, one fault/recovery path, resource
 budgets and an independent build/run record. A prototype on a bench is not a
 certified industrial/safety system. Preserve learner code; do not flash, build
 or run it just because a file exists or the learner says "next".

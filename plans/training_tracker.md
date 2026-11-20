@@ -1,28 +1,19 @@
-# MCU / RTOS Training And Evidence Tracker
+# MCU / FreeRTOS Interview-Focused Training And Evidence Tracker
 
-Updated 2026-11-17; MCU/FreeRTOS-first pivot approved on 2026-10-26.
-[Roadmap](five_month_development_roadmap.md) owns schedule;
-[project contracts](project_portfolio.md) own acceptance;
-[log](learning_log.md) preserves history.
+Updated 2026-11-20; **10-Day (Extensible) Interview-Focused MCU, Embedded C & FreeRTOS Plan** approved 2026-11-20 after SHA-256 snapshotting all 62 working files of the prior hardware-first track in [backup/plan/2026-11-20-mcu-hardware-track](../backup/plan/2026-11-20-mcu-hardware-track/README.md) and [backup/skills/2026-11-20-mcu-hardware-track](../backup/skills/2026-11-20-mcu-hardware-track/README.md).
+[10-Day Plan](five_month_development_roadmap.md) owns schedule;
+[Theoretical P1 & Workplace Bridge](project_portfolio.md) owns architecture scope;
+[Log](learning_log.md) preserves dated history.
 
 ## Current Position
 
-- Week 1 In progress; 22 h/week through the 22 March 2027 preparation/interview
-  target. No extra time or mastery inferred from changing the plan.
-- Active focus: MCU driver ownership, C01 runtime evidence and board/toolchain
-  readiness before FreeRTOS integration.
-- Requested peripheral & DMA reference
-  [W04-L25](../notes/lessons/W04_L25_i2c_spi_debug_interrupts_and_dma.md)
-  **Published & revised (rev 3)**, 2026-11-17: Part I (`Scenes 1–4`) covers
-  simple foundations for `I2C`, `SPI`, `ADC`, `DMA`, and 4 separate interrupt
-  paths; Part II (`Scenes 5–9`) traces continuous `6`-byte scenarios
-  (`{0xAA..0xFF}` on `SPI1` and `I2C1`, and `3 x 16-bit = 6 bytes` on `ADC1`)
-  from `84 MHz` clock + `GPIO` + peripheral init through CPU Polling, CPU
-  Interrupt, DMA Polling, and DMA Interrupt in direct CMSIS register code
-  (zero HAL), plus outside-in debugging and DMA buffer quiescence.
-  Document/source-reviewed synthetic examples only; target selection, wiring,
-  implementation and physical tests remain pending. Publication does not mark
-  the P1 driver milestones complete.
+- **Day 1 tutoring companion published, 2026-11-20:** [Worked P1 walkthrough and reading route](../notes/lessons/W04_L26_day_1_tutoring.md). Source-based examples only; reading, independent recall and board results are not recorded.
+
+- **Active Track (Approved 2026-11-20):** **10-Day Interview-Readiness Sprint (`2026-11-21` to `2026-11-30`)** at `~1.5–2 h/day` (`~18–20 h` baseline; extensible in days or daily hours as needed so **zero required/important topics are skipped**).
+- **Study Mode:** Plain-English, reading-first, official-source-verified conceptual & code-walkthrough mastery using **FreeRTOS** as the sole RTOS tool. Hands-on board flashing and `Zephyr` (`P2`) are **not required** right now; theoretical `P1` design is connected honestly to the learner's real day-to-day 32-bit Infineon **AURIX** IC-driver cyclic functions, AUTOSAR CDD integration, architecture/interface reviews, integration testing, FMEA/HAZOP participation, and Polyspace/MISRA work.
+- **Day 1 Lesson Published (`2026-11-20`):** [W04-L26: FreeRTOS Complete Remaining Interview Pillars (`Ch 3, 6, 9, 11–13`)](../notes/lessons/W04_L26_freertos_heaps_timers_event_groups_stream_buffers_and_diagnostics.md) — `heap_1..heap_5` vs. static allocation, Software Timers (`prvTimerTask` daemon & command queue), Event Groups (`AND`/`OR`, `xEventGroupSync`, and `SetBitsFromISR` daemon deferral), Stream & Message Buffers (`SPSC` `DMA -> Task`), Stack Overflow (`Method 1` vs. `Method 2` vs. Cortex-M `MPU`), Runtime Stats, and Tickless Idle (`WFI`). Publication does not mark learner mastery complete.
+- **Synchronization Lesson Audited & Repaired (`2026-11-20`, rev 5):** [W04-L24](../notes/lessons/W04_L24_freertos_synchronization_and_priority_inversion.md) rewritten and line-by-line verified against upstream `FreeRTOS-Kernel/queue.c`, `semphr.h`, `GCC/ARM_CM4F/portmacro.h`, and *Mastering the FreeRTOS Real Time Kernel* (`Ch 5, 7, 8`).
+- **Peripheral & DMA Reference (`2026-11-18`, rev 5):** [W04-L25](../notes/lessons/W04_L25_i2c_spi_debug_interrupts_and_dma.md) covers `I2C`, `SPI`, `ADC`, generic cross-MCU `DMA` (`Stream` vs. `Channel`), 4 interrupt paths, and 4 transfer modes.
 - Optional Pico setup, 2026-11-07: learner reports `RPI-RP2` USB bootloader
   detection and extension installation. Tutor's second read-only VS Code CLI
   inventory confirms official Pico extension 0.23.0. Learner subsequently
